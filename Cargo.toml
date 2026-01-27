@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "minesweeper_core",
+    "cli",
+    "gui",
+    "web",
+]
+resolver = "2"

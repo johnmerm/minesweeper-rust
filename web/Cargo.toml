@@ -1,0 +1,10 @@
+[package]
+name = "web"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minesweeper_core = { path = "../minesweeper_core" }
+actix-web = "4"
+tera = "1"
+serde = { version = "1.0", features = ["derive"] }
