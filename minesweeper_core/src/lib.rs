@@ -2,6 +2,9 @@ use rand::Rng;
 use std::fmt;
 use serde::Serialize;
 
+pub mod probability;
+use probability::{MonteCarlo, ProbabilityStrategy};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CellState {
     Hidden,
@@ -38,6 +41,7 @@ pub enum GameState {
     Lost,
 }
 
+#[derive(Clone)]
 pub struct Minesweeper {
     pub width: usize,
     pub height: usize,
@@ -207,6 +211,15 @@ impl Minesweeper {
         if hidden_non_mines == 0 {
             self.state = GameState::Won;
         }
+    }
+}
+
+impl Minesweeper {
+    /// Estimates the probability that each unopened cell contains a mine.
+    /// Delegates to [`MonteCarlo`] by default.
+    pub fn calculate_mine_probabilities
+    (&self) -> Vec<Vec<f64>> {
+        MonteCarlo::new().calculate(self)
     }
 }
 
