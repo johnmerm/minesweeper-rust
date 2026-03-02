@@ -35,12 +35,14 @@ impl MonteCarlo {
                 strategy: Strategy::MonteCarlo,
                 attempts: 0,
                 valid: 0,
+                memory_bytes: 0,
                 probs: vec![vec![0.0; game.width]; game.height],
             });
             return;
         };
 
         let n = setup.hidden_cells.len();
+        let memory_bytes = mc_memory_estimate(&setup);
         let total_combos = combinations(n, setup.mines_to_place);
         let use_exact = total_combos <= self.max_valid as f64;
         let max_steps = if use_exact { total_combos as usize } else { self.max_attempts };
@@ -53,6 +55,7 @@ impl MonteCarlo {
                 attempts: step,
                 valid: valid as usize,
                 max_attempts: max_steps,
+                memory_bytes,
                 probs,
             })
             .is_ok()
@@ -81,6 +84,7 @@ impl MonteCarlo {
             strategy: Strategy::MonteCarlo,
             attempts,
             valid: valid_count as usize,
+            memory_bytes,
             probs,
         });
     }
@@ -503,6 +507,32 @@ fn propagate(
         .collect();
 
     (certain_mines, certain_safe, updated_constraints, mines_to_place)
+}
+
+/// Rough heap estimate for the Monte Carlo strategy's working set.
+///
+/// Accounts for SimSetup storage plus the per-run border/interior
+/// vectors, mine-count accumulator, and constraint re-indexing structures.
+pub(crate) fn mc_memory_estimate(setup: &SimSetup) -> usize {
+    let n = setup.hidden_cells.len();
+    let total_neighbors: usize = setup.constraints.iter().map(|(ns, _)| ns.len()).sum();
+    let c = setup.constraints.len();
+
+    // SimSetup heap
+    let setup_heap = n * 16               // hidden_cells: Vec<(usize, usize)>
+        + total_neighbors * 8 + c * 24   // constraints: Vec<(Vec<usize>, usize)>
+        + setup.certain_mines.len() * 16; // certain_mines
+
+    // Working set: mine_counts + border/interior vecs + b_indices + is_mine_b
+    //              + border_constraints + border_pos HashMap (rough 48 B/entry)
+    let working = n * 8      // mine_counts: Vec<f64>
+        + n * 8              // border + interior vecs (upper bound n each)
+        + n * 8              // b_indices
+        + n                  // is_mine_b: Vec<bool>
+        + total_neighbors * 8 + c * 24  // border_constraints (same size as constraints)
+        + n * 48;            // border_pos HashMap entries
+
+    setup_heap + working
 }
 
 pub(crate) fn build_probs(

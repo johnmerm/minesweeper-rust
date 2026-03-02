@@ -34,6 +34,7 @@ pub enum SimUpdate {
         attempts: usize,
         valid: usize,
         max_attempts: usize,
+        memory_bytes: usize,
         probs: Vec<Vec<f64>>,
     },
     /// Sent once when the simulation finishes.
@@ -41,6 +42,7 @@ pub enum SimUpdate {
         strategy: Strategy,
         attempts: usize,
         valid: usize,
+        memory_bytes: usize,
         probs: Vec<Vec<f64>>,
     },
 }

@@ -27,17 +27,21 @@ struct MinesweeperGui {
     init: qt_method!(fn(&mut self)),
     reveal: qt_method!(fn(&mut self, index: i32)),
     flag: qt_method!(fn(&mut self, index: i32)),
-    reset: qt_method!(fn(&mut self)),
+    reset: qt_method!(fn(&mut self, w: i32, h: i32, m: i32)),
     check_prob_update: qt_method!(fn(&mut self)),
 
     game: Option<Minesweeper>,
-    /// Currently displayed mine probabilities (best available from any strategy).
+    /// Best-priority probs — used for cell background colour.
     probs: Vec<Vec<f64>>,
+    /// Per-strategy probability grids, shown independently in each cell.
+    mc_probs: Vec<Vec<f64>>,
+    cs_probs: Vec<Vec<f64>>,
+    mc_has_data: bool,
+    cs_has_data: bool,
     prob_rx: Option<Receiver<SimUpdate>>,
     /// Strategies that have sent their Done message.
     done_strategies: HashSet<Strategy>,
     /// Priority level of the strategy whose data is currently in `probs`.
-    /// Higher priority strategies (exact > sampling) override lower ones.
     probs_priority: u8,
 }
 
@@ -46,7 +50,12 @@ impl MinesweeperGui {
         let game = Minesweeper::new(10, 10, 10);
         self.board_width = 10;
         self.board_height = 10;
-        self.probs = uniform_probs(&game);
+        let up = uniform_probs(&game);
+        self.probs = up.clone();
+        self.mc_probs = up.clone();
+        self.cs_probs = up;
+        self.mc_has_data = false;
+        self.cs_has_data = false;
         self.game = Some(game);
         self.render_cells();
         self.boardChanged();
@@ -70,12 +79,22 @@ impl MinesweeperGui {
         }
     }
 
-    fn reset(&mut self) {
+    fn reset(&mut self, w: i32, h: i32, m: i32) {
+        let w = (w as usize).clamp(3, 50);
+        let h = (h as usize).clamp(3, 50);
+        let m = (m as usize).clamp(1, w * h - 1);
         self.prob_rx = None;
         self.done_strategies.clear();
         self.probs_priority = 0;
-        let game = Minesweeper::new(10, 10, 10);
-        self.probs = uniform_probs(&game);
+        let game = Minesweeper::new(w, h, m);
+        self.board_width = w as i32;
+        self.board_height = h as i32;
+        let up = uniform_probs(&game);
+        self.probs = up.clone();
+        self.mc_probs = up.clone();
+        self.cs_probs = up;
+        self.mc_has_data = false;
+        self.cs_has_data = false;
         self.game = Some(game);
         self.sim_status = QString::default();
         self.cs_status = QString::default();
@@ -110,60 +129,83 @@ impl MinesweeperGui {
                     valid,
                     attempts,
                     max_attempts,
+                    memory_bytes,
                     probs,
                 } => {
-                    if valid > 0 && self.try_update_probs(Strategy::MonteCarlo, probs) {
-                        any_change = true;
+                    if valid > 0 {
+                        self.mc_probs = probs.clone();
+                        self.mc_has_data = true;
+                        if self.try_update_probs(Strategy::MonteCarlo, probs) {
+                            any_change = true;
+                        }
                     }
                     self.sim_status = QString::from(format!(
-                        "{} valid  /  {} of {} sampled",
-                        valid, attempts, max_attempts
+                        "MC: {} valid  /  {} of {} sampled  [{}]",
+                        valid, attempts, max_attempts, fmt_memory(memory_bytes)
                     ));
                 }
                 SimUpdate::Done {
                     strategy: Strategy::MonteCarlo,
                     valid,
                     attempts,
+                    memory_bytes,
                     probs,
                 } => {
-                    if valid > 0 && self.try_update_probs(Strategy::MonteCarlo, probs) {
-                        any_change = true;
+                    if valid > 0 {
+                        self.mc_probs = probs.clone();
+                        self.mc_has_data = true;
+                        if self.try_update_probs(Strategy::MonteCarlo, probs) {
+                            any_change = true;
+                        }
                     }
                     self.done_strategies.insert(Strategy::MonteCarlo);
                     self.sim_status = QString::from(format!(
-                        "✓ {} valid  /  {} sampled",
-                        valid, attempts
+                        "✓ MC: {} valid  /  {} sampled  [{}]",
+                        valid, attempts, fmt_memory(memory_bytes)
                     ));
                 }
                 SimUpdate::Progress {
                     strategy: Strategy::ConstraintSearch,
                     valid,
                     attempts,
+                    memory_bytes,
                     probs,
                     ..
                 } => {
-                    if valid > 0 && self.try_update_probs(Strategy::ConstraintSearch, probs) {
-                        any_change = true;
+                    if valid > 0 {
+                        self.cs_probs = probs.clone();
+                        self.cs_has_data = true;
+                        if self.try_update_probs(Strategy::ConstraintSearch, probs) {
+                            any_change = true;
+                        }
                     }
                     self.cs_status = if valid > 0 {
-                        QString::from(format!("CS: {} layouts / {} steps", valid, attempts))
+                        QString::from(format!(
+                            "CS: {} layouts / {} steps  [{}]",
+                            valid, attempts, fmt_memory(memory_bytes)
+                        ))
                     } else {
-                        QString::from("CS: searching…")
+                        QString::from(format!("CS: searching…  [{}]", fmt_memory(memory_bytes)))
                     };
                 }
                 SimUpdate::Done {
                     strategy: Strategy::ConstraintSearch,
                     valid,
                     attempts,
+                    memory_bytes,
                     probs,
                 } => {
-                    if valid > 0 && self.try_update_probs(Strategy::ConstraintSearch, probs) {
-                        any_change = true;
+                    if valid > 0 {
+                        self.cs_probs = probs.clone();
+                        self.cs_has_data = true;
+                        if self.try_update_probs(Strategy::ConstraintSearch, probs) {
+                            any_change = true;
+                        }
                     }
                     self.done_strategies.insert(Strategy::ConstraintSearch);
                     self.cs_status = QString::from(format!(
-                        "✓ CS: {} layouts / {} steps",
-                        valid, attempts
+                        "✓ CS: {} layouts / {} steps  [{}]",
+                        valid, attempts, fmt_memory(memory_bytes)
                     ));
                 }
             }
@@ -207,6 +249,8 @@ impl MinesweeperGui {
                 self.prob_rx = Some(rx);
                 self.done_strategies.clear();
                 self.probs_priority = 0;
+                self.mc_has_data = false;
+                self.cs_has_data = false;
 
                 let mc_tx = tx.clone();
                 let cs_tx = tx;
@@ -282,11 +326,15 @@ impl MinesweeperGui {
                         "".to_string()
                     };
 
-                    let prob_text = if matches!(cell.state, CellState::Hidden | CellState::Flagged) {
-                        format!("{:.0}%", p * 100.0)
-                    } else {
-                        String::new()
-                    };
+                    let is_hidden = matches!(cell.state, CellState::Hidden | CellState::Flagged);
+                    let mc_p = self.mc_probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(0.0);
+                    let cs_p = self.cs_probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(0.0);
+                    let mc_prob_text = if is_hidden && self.mc_has_data {
+                        format!("{:.0}%", mc_p * 100.0)
+                    } else { String::new() };
+                    let cs_prob_text = if is_hidden && self.cs_has_data {
+                        format!("{:.0}%", cs_p * 100.0)
+                    } else { String::new() };
 
                     // A hidden cell is a "border" cell if it is adjacent to at least one
                     // visible numbered cell — i.e. it is directly constrained.
@@ -312,7 +360,8 @@ impl MinesweeperGui {
                     map.insert(QString::from("text"), QString::from(final_text).into());
                     map.insert(QString::from("color"), QString::from(color).into());
                     map.insert(QString::from("bgColor"), QString::from(bg_color).into());
-                    map.insert(QString::from("probText"), QString::from(prob_text).into());
+                    map.insert(QString::from("mcProbText"), QString::from(mc_prob_text).into());
+                    map.insert(QString::from("csProbText"), QString::from(cs_prob_text).into());
                     map.insert(QString::from("isBorder"), is_border.into());
                     new_cells.push(map.into());
                 }
@@ -337,6 +386,15 @@ fn uniform_probs(game: &Minesweeper) -> Vec<Vec<f64>> {
     vec![vec![p; game.width]; game.height]
 }
 
+/// Human-readable memory size (B / KB / MB).
+fn fmt_memory(bytes: usize) -> String {
+    match bytes {
+        b if b < 1_024             => format!("{} B", b),
+        b if b < 1_024 * 1_024    => format!("{:.1} KB", b as f64 / 1_024.0),
+        b                          => format!("{:.1} MB", b as f64 / 1_048_576.0),
+    }
+}
+
 /// Human-readable scale suffix (K / M / B / T / scientific).
 fn fmt_count(v: f64) -> String {
     match v {
@@ -358,11 +416,43 @@ import Minesweeper 1.0
 ApplicationWindow {
     id: root
     visible: true
-    width: 340
-    height: 500
+
+    // Approximate height / width consumed by non-grid UI elements (margins, labels, controls).
+    property int uiPadH: 210
+    property int uiPadW: 20
+
+    // Cell size fills available window space, clamped to a sensible minimum.
+    property int cellSize: Math.max(10, Math.floor(
+        Math.min(
+            (root.width  - uiPadW) / minesweeper.board_width,
+            (root.height - uiPadH) / minesweeper.board_height
+        )
+    ))
+
+    width:  320
+    height: 520
+    minimumWidth:  minesweeper.board_width  * 12 + uiPadW
+    minimumHeight: minesweeper.board_height * 12 + uiPadH
     title: "Rust Minesweeper"
 
     property string hoveredProb: ""
+    property int prevBoardW: -1
+    property int prevBoardH: -1
+
+    // Resize the window to a sensible default whenever the board dimensions change
+    // (i.e. a new game with different W/H). Moves don't change dimensions so the
+    // window stays at whatever size the user last dragged it to.
+    Connections {
+        target: minesweeper
+        function onBoardChanged() {
+            if (minesweeper.board_width !== prevBoardW || minesweeper.board_height !== prevBoardH) {
+                root.width  = minesweeper.board_width  * 32 + root.uiPadW
+                root.height = minesweeper.board_height * 32 + root.uiPadH
+                prevBoardW = minesweeper.board_width
+                prevBoardH = minesweeper.board_height
+            }
+        }
+    }
 
     MinesweeperGame {
         id: minesweeper
@@ -420,8 +510,8 @@ ApplicationWindow {
             Repeater {
                 model: minesweeper.cells
                 delegate: Rectangle {
-                    width: 30
-                    height: 30
+                    width: root.cellSize
+                    height: root.cellSize
                     color: modelData.bgColor
                     border.color: modelData.isBorder ? "#5599ff" : "#999"
                     border.width: modelData.isBorder ? 2 : 1
@@ -431,13 +521,24 @@ ApplicationWindow {
                         text: modelData.text
                         color: modelData.color
                         font.bold: true
+                        font.pixelSize: Math.max(8, root.cellSize - 10)
                     }
 
                     Text {
-                        visible: modelData.probText !== ""
-                        text: modelData.probText
-                        font.pixelSize: 8
-                        color: "#333"
+                        visible: modelData.mcProbText !== "" && root.cellSize >= 14
+                        text: modelData.mcProbText
+                        font.pixelSize: 7
+                        color: "#888"
+                        anchors.top: parent.top
+                        anchors.right: parent.right
+                        anchors.margins: 1
+                    }
+
+                    Text {
+                        visible: modelData.csProbText !== "" && root.cellSize >= 14
+                        text: modelData.csProbText
+                        font.pixelSize: 7
+                        color: "#558"
                         anchors.bottom: parent.bottom
                         anchors.right: parent.right
                         anchors.margins: 1
@@ -447,7 +548,15 @@ ApplicationWindow {
                         anchors.fill: parent
                         hoverEnabled: true
                         acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        onEntered: root.hoveredProb = modelData.probText !== "" ? "Mine probability: " + modelData.probText : ""
+                        onEntered: {
+                            var mc = modelData.mcProbText
+                            var cs = modelData.csProbText
+                            if (mc !== "" || cs !== "") {
+                                root.hoveredProb = "MC: " + (mc !== "" ? mc : "?") + "  |  CS: " + (cs !== "" ? cs : "?")
+                            } else {
+                                root.hoveredProb = ""
+                            }
+                        }
                         onExited: root.hoveredProb = ""
                         onClicked: {
                             if (mouse.button === Qt.RightButton) {
@@ -461,10 +570,25 @@ ApplicationWindow {
             }
         }
 
+        // New-game settings row
+        RowLayout {
+            Layout.alignment: Qt.AlignHCenter
+            spacing: 6
+
+            Text { text: "W:"; font.pixelSize: 12 }
+            SpinBox { id: wSpin; from: 3; to: 50; value: 10; implicitWidth: 75 }
+
+            Text { text: "H:"; font.pixelSize: 12 }
+            SpinBox { id: hSpin; from: 3; to: 50; value: 10; implicitWidth: 75 }
+
+            Text { text: "M:"; font.pixelSize: 12 }
+            SpinBox { id: mSpin; from: 1; to: 999; value: 10; implicitWidth: 80 }
+        }
+
         Button {
             text: "New Game"
             Layout.alignment: Qt.AlignHCenter
-            onClicked: minesweeper.reset()
+            onClicked: minesweeper.reset(wSpin.value, hSpin.value, mSpin.value)
         }
 
         Item { Layout.fillHeight: true }

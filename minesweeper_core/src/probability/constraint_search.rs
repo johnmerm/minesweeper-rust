@@ -4,7 +4,7 @@ use std::sync::mpsc::Sender;
 use crate::Minesweeper;
 
 use super::{ProbabilityStrategy, SimUpdate, Strategy};
-use super::monte_carlo::{SimSetup, build_probs, combinations};
+use super::monte_carlo::{SimSetup, build_probs, combinations, mc_memory_estimate};
 
 /// Exact mine probability estimation using depth-first constraint enumeration.
 ///
@@ -31,12 +31,14 @@ impl ConstraintSearch {
                 strategy: Strategy::ConstraintSearch,
                 attempts: 0,
                 valid: 0,
+                memory_bytes: 0,
                 probs: vec![vec![0.0; game.width]; game.height],
             });
             return;
         };
 
         let n = setup.hidden_cells.len();
+        let memory_bytes = cs_memory_estimate(&setup);
         let constraint_cells: HashSet<usize> = setup
             .constraints
             .iter()
@@ -63,6 +65,7 @@ impl ConstraintSearch {
                     attempts: step,
                     valid: valid as usize,
                     max_attempts: 0,
+                    memory_bytes,
                     probs,
                 })
                 .is_ok()
@@ -88,6 +91,7 @@ impl ConstraintSearch {
             strategy: Strategy::ConstraintSearch,
             attempts: step_count,
             valid: valid_count as usize,
+            memory_bytes,
             probs,
         });
     }
@@ -313,4 +317,36 @@ where
             self.aborted = true;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Memory estimation
+// ---------------------------------------------------------------------------
+
+/// Rough heap estimate for the Constraint Search strategy's working set.
+///
+/// Accounts for SimSetup storage (shared with MC) plus the DFS-specific
+/// structures: assignment vector, mine-count accumulator, and call-stack
+/// frame cost (combo + unassigned + is_mine_pos vectors per depth level).
+fn cs_memory_estimate(setup: &SimSetup) -> usize {
+    let n = setup.hidden_cells.len();
+    let total_neighbors: usize = setup.constraints.iter().map(|(ns, _)| ns.len()).sum();
+    let c = setup.constraints.len();
+
+    // SimSetup heap (same formula as in mc_memory_estimate)
+    let setup_heap = mc_memory_estimate(setup);
+
+    // DFS working set
+    let avg_unassigned = total_neighbors.checked_div(c).unwrap_or(0);
+    let stack_frame = avg_unassigned * 8  // combo: Vec<usize>
+        + avg_unassigned * 8             // unassigned: Vec<usize>
+        + avg_unassigned                 // is_mine_pos: Vec<bool>
+        + 64;                            // Dfs struct overhead per frame
+    let dfs_stack = c * stack_frame;
+
+    let working = n          // assignment: Vec<Option<bool>> (1 byte each)
+        + n * 8              // mine_counts: Vec<f64>
+        + dfs_stack;
+
+    setup_heap + working
 }
