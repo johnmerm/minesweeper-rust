@@ -21,6 +21,8 @@ struct MinesweeperGui {
     /// Status line for the Constraint Search (DFS) strategy.
     cs_status: qt_property!(QString; NOTIFY boardChanged),
     layout_count: qt_property!(QString; NOTIFY boardChanged),
+    /// When true, cells whose mine probability is exactly 0 are revealed automatically.
+    auto_reveal: qt_property!(bool; NOTIFY boardChanged),
 
     boardChanged: qt_signal!(),
 
@@ -218,9 +220,50 @@ impl MinesweeperGui {
         }
 
         if any_change {
+            self.maybe_auto_reveal();
             self.render_cells();
             self.boardChanged();
         }
+    }
+
+    /// If auto-reveal is on, reveal every hidden cell whose best-estimate mine
+    /// probability is exactly 0. Uses the highest-priority strategy's probs
+    /// (`self.probs`), so CS results (exact) take precedence over MC ones.
+    /// Reveals are done in one pass; the resulting `update_view` call re-launches
+    /// the simulation on the new board state, which may expose further safe cells
+    /// on the next timer tick.
+    fn maybe_auto_reveal(&mut self) {
+        if !self.auto_reveal {
+            return;
+        }
+        // Only act when the game is running and mines are already placed.
+        let should_run = self.game.as_ref()
+            .map(|g| g.state == GameState::Playing && g.mines_generated)
+            .unwrap_or(false);
+        if !should_run {
+            return;
+        }
+
+        let game = self.game.as_ref().unwrap();
+        let to_reveal: Vec<(usize, usize)> = (0..game.height)
+            .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                game.grid[y][x].state == CellState::Hidden
+                    && self.probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(1.0) < 1e-9
+            })
+            .collect();
+
+        if to_reveal.is_empty() {
+            return;
+        }
+
+        let game = self.game.as_mut().unwrap();
+        for (x, y) in to_reveal {
+            game.reveal(x, y);
+        }
+        // Re-run the simulation on the updated board; the timer will call
+        // check_prob_update → maybe_auto_reveal again if new safe cells appear.
+        self.update_view();
     }
 
     /// Update `self.probs` with `new_probs` if `strategy` has higher or equal
@@ -585,10 +628,21 @@ ApplicationWindow {
             SpinBox { id: mSpin; from: 1; to: 999; value: 10; implicitWidth: 80 }
         }
 
-        Button {
-            text: "New Game"
+        RowLayout {
             Layout.alignment: Qt.AlignHCenter
-            onClicked: minesweeper.reset(wSpin.value, hSpin.value, mSpin.value)
+            spacing: 10
+
+            CheckBox {
+                text: "Auto-reveal safe cells"
+                checked: minesweeper.auto_reveal
+                onCheckedChanged: minesweeper.auto_reveal = checked
+                font.pixelSize: 12
+            }
+
+            Button {
+                text: "New Game"
+                onClicked: minesweeper.reset(wSpin.value, hSpin.value, mSpin.value)
+            }
         }
 
         Item { Layout.fillHeight: true }

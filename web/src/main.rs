@@ -1,5 +1,5 @@
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
-use minesweeper_core::{Minesweeper, CellState, CellContent};
+use minesweeper_core::{Minesweeper, CellState, CellContent, GameState};
 use minesweeper_core::probability::{MonteCarlo, ConstraintSearch, SimUpdate};
 use std::sync::{Mutex, mpsc::Sender};
 use tera::{Tera, Context};
@@ -17,6 +17,7 @@ struct AppState {
     game: Mutex<Minesweeper>,
     /// Last-used board settings, shown as defaults in the New Game form.
     settings: Mutex<(usize, usize, usize)>,
+    auto_reveal: Mutex<bool>,
     tera: Tera,
 }
 
@@ -61,17 +62,46 @@ fn fmt_memory(bytes: usize) -> String {
     }
 }
 
+#[post("/toggle-auto-reveal")]
+async fn toggle_auto_reveal(data: web::Data<AppState>) -> impl Responder {
+    let mut ar = data.auto_reveal.lock().unwrap();
+    *ar = !*ar;
+    HttpResponse::SeeOther().insert_header(("Location", "/")).finish()
+}
+
 #[get("/")]
 async fn index(data: web::Data<AppState>) -> impl Responder {
-    let game = data.game.lock().unwrap();
+    let mut game = data.game.lock().unwrap();
     let (sw, sh, sm) = *data.settings.lock().unwrap();
+    let auto_reveal = *data.auto_reveal.lock().unwrap();
 
     let (mc_probs, mc_valid, mc_attempts, mc_mem) =
         run_sync(|tx| MonteCarlo::new().calculate_with_progress(&game, tx));
     let (cs_probs, cs_valid, cs_attempts, cs_mem) =
         run_sync(|tx| ConstraintSearch::new().calculate_with_progress(&game, tx));
 
-    let probs = if cs_valid > 0 { cs_probs } else { mc_probs };
+    let mut probs = if cs_valid > 0 { cs_probs } else { mc_probs };
+
+    // If auto-reveal is on, reveal all 0-probability hidden cells and recompute
+    // until none remain. The game's built-in cascade handles empty-cell spreading.
+    if auto_reveal && game.state == GameState::Playing && game.mines_generated {
+        loop {
+            let to_reveal: Vec<(usize, usize)> = (0..game.height)
+                .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| game.grid[y][x].state == CellState::Hidden && probs[y][x] < 1e-9)
+                .collect();
+            if to_reveal.is_empty() {
+                break;
+            }
+            for (x, y) in to_reveal {
+                game.reveal(x, y);
+            }
+            let (_, _, _, mc_mem2) = run_sync(|tx| MonteCarlo::new().calculate_with_progress(&game, tx));
+            let (cs2, cs_valid2, _, _) = run_sync(|tx| ConstraintSearch::new().calculate_with_progress(&game, tx));
+            let _ = mc_mem2; // memory not needed for the loop
+            if cs_valid2 > 0 { probs = cs2; } else { break; }
+        }
+    }
 
     let mc_status = format!(
         "MC: {} valid / {} sampled  [{}]",
@@ -111,6 +141,7 @@ async fn index(data: web::Data<AppState>) -> impl Responder {
     context.insert("settings_width",  &sw);
     context.insert("settings_height", &sh);
     context.insert("settings_mines",  &sm);
+    context.insert("auto_reveal", &auto_reveal);
 
     let rendered = data.tera.render("index.html", &context).unwrap();
     HttpResponse::Ok().body(rendered)
@@ -148,7 +179,8 @@ async fn main() -> std::io::Result<()> {
     let tera = Tera::new("web/templates/**/*").unwrap();
     let game = Mutex::new(Minesweeper::new(10, 10, 10));
     let settings = Mutex::new((10usize, 10usize, 10usize));
-    let app_data = web::Data::new(AppState { game, settings, tera });
+    let auto_reveal = Mutex::new(false);
+    let app_data = web::Data::new(AppState { game, settings, auto_reveal, tera });
 
     println!("Starting web server at http://127.0.0.1:8080");
 
@@ -159,6 +191,7 @@ async fn main() -> std::io::Result<()> {
             .service(reveal)
             .service(flag)
             .service(new_game)
+            .service(toggle_auto_reveal)
     })
     .bind(("127.0.0.1", 8080))?
     .run()

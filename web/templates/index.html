@@ -96,18 +96,25 @@
     </div>
 
     <div class="controls">
-        <form action="/new" method="post" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center;">
-            <label style="font-size:13px;">W:
-                <input type="number" name="width"  value="{{ settings_width  }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
-            </label>
-            <label style="font-size:13px;">H:
-                <input type="number" name="height" value="{{ settings_height }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
-            </label>
-            <label style="font-size:13px;">Mines:
-                <input type="number" name="mines"  value="{{ settings_mines  }}" min="1" max="999" style="width:52px; font-size:13px; padding:2px;">
-            </label>
-            <button type="submit">New Game</button>
-        </form>
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:center; margin-bottom:8px;">
+            <form action="/new" method="post" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center;">
+                <label style="font-size:13px;">W:
+                    <input type="number" name="width"  value="{{ settings_width  }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
+                </label>
+                <label style="font-size:13px;">H:
+                    <input type="number" name="height" value="{{ settings_height }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
+                </label>
+                <label style="font-size:13px;">Mines:
+                    <input type="number" name="mines"  value="{{ settings_mines  }}" min="1" max="999" style="width:52px; font-size:13px; padding:2px;">
+                </label>
+                <button type="submit">New Game</button>
+            </form>
+            <form action="/toggle-auto-reveal" method="post" style="display:inline;">
+                <button type="submit" style="{% if auto_reveal %}background:#c8f0c8;{% endif %}">
+                    Auto-reveal safe cells: {{ auto_reveal }}
+                </button>
+            </form>
+        </div>
     </div>
 
     <p style="font-size:12px; color:#777;">Left click to reveal · Right click to flag</p>
