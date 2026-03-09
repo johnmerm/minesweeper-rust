@@ -2,8 +2,10 @@ use crate::Minesweeper;
 
 pub mod monte_carlo;
 pub mod constraint_search;
+pub mod fpga_bp;
 pub use monte_carlo::MonteCarlo;
 pub use constraint_search::ConstraintSearch;
+pub use fpga_bp::FpgaBp;
 
 pub trait ProbabilityStrategy {
     fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>>;
@@ -13,6 +15,8 @@ pub trait ProbabilityStrategy {
 pub enum Strategy {
     MonteCarlo,
     ConstraintSearch,
+    /// FPGA-ready Belief Propagation — approximate but tractable at large scale.
+    FpgaBp,
 }
 
 impl Strategy {
@@ -21,7 +25,8 @@ impl Strategy {
     pub fn priority(self) -> u8 {
         match self {
             Strategy::MonteCarlo => 1,
-            Strategy::ConstraintSearch => 2,
+            Strategy::FpgaBp => 2,
+            Strategy::ConstraintSearch => 3,
         }
     }
 }
