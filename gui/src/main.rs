@@ -2,6 +2,8 @@ use qmetaobject::prelude::*;
 use qmetaobject::{QVariantList, QVariantMap};
 use minesweeper_core::{Minesweeper, CellState, CellContent, GameState};
 use minesweeper_core::probability::{MonteCarlo, ConstraintSearch, SimUpdate, Strategy};
+#[cfg(feature = "neural")]
+use minesweeper_core::probability::NeuralNetwork;
 use minesweeper_core::probability::monte_carlo::combinations;
 use cstr::cstr;
 use std::collections::HashSet;
@@ -20,6 +22,8 @@ struct MinesweeperGui {
     sim_status: qt_property!(QString; NOTIFY boardChanged),
     /// Status line for the Constraint Search (DFS) strategy.
     cs_status: qt_property!(QString; NOTIFY boardChanged),
+    /// Status line for the Neural Network strategy.
+    nn_status: qt_property!(QString; NOTIFY boardChanged),
     layout_count: qt_property!(QString; NOTIFY boardChanged),
     /// When true, cells whose mine probability is exactly 0 are revealed automatically.
     auto_reveal: qt_property!(bool; NOTIFY boardChanged),
@@ -38,8 +42,12 @@ struct MinesweeperGui {
     /// Per-strategy probability grids, shown independently in each cell.
     mc_probs: Vec<Vec<f64>>,
     cs_probs: Vec<Vec<f64>>,
+    #[cfg(feature = "neural")] nn_probs: Vec<Vec<f64>>,
     mc_has_data: bool,
     cs_has_data: bool,
+    #[cfg(feature = "neural")] nn_has_data: bool,
+    /// Path to ONNX model file; loaded once on first use.
+    #[cfg(feature = "neural")] nn_model_path: String,
     prob_rx: Option<Receiver<SimUpdate>>,
     /// Strategies that have sent their Done message.
     done_strategies: HashSet<Strategy>,
@@ -55,9 +63,16 @@ impl MinesweeperGui {
         let up = uniform_probs(&game);
         self.probs = up.clone();
         self.mc_probs = up.clone();
-        self.cs_probs = up;
+        self.cs_probs = up.clone();
+        #[cfg(feature = "neural")] { self.nn_probs = up; }
+        #[cfg(feature = "neural")] { self.nn_has_data = false; }
+        #[cfg(not(feature = "neural"))] { let _ = up; }
         self.mc_has_data = false;
         self.cs_has_data = false;
+        #[cfg(feature = "neural")] {
+            self.nn_model_path = std::env::var("NN_MODEL_PATH")
+                .unwrap_or_else(|_| "neural/onnx/model.onnx".to_string());
+        }
         self.game = Some(game);
         self.render_cells();
         self.boardChanged();
@@ -94,12 +109,16 @@ impl MinesweeperGui {
         let up = uniform_probs(&game);
         self.probs = up.clone();
         self.mc_probs = up.clone();
-        self.cs_probs = up;
+        self.cs_probs = up.clone();
+        #[cfg(feature = "neural")] { self.nn_probs = up; }
+        #[cfg(not(feature = "neural"))] { let _ = up; }
         self.mc_has_data = false;
         self.cs_has_data = false;
+        #[cfg(feature = "neural")] { self.nn_has_data = false; }
         self.game = Some(game);
         self.sim_status = QString::default();
         self.cs_status = QString::default();
+        self.nn_status = QString::default();
         self.render_cells();
         self.boardChanged();
     }
@@ -210,11 +229,41 @@ impl MinesweeperGui {
                         valid, attempts, fmt_memory(memory_bytes)
                     ));
                 }
+                #[cfg(feature = "neural")]
+                SimUpdate::Done {
+                    strategy: Strategy::NeuralNetwork,
+                    valid,
+                    memory_bytes,
+                    probs,
+                    ..
+                } => {
+                    if valid > 0 {
+                        self.nn_probs = probs.clone();
+                        self.nn_has_data = true;
+                        if self.try_update_probs(Strategy::NeuralNetwork, probs) {
+                            any_change = true;
+                        }
+                    }
+                    self.done_strategies.insert(Strategy::NeuralNetwork);
+                    self.nn_status = QString::from(format!(
+                        "✓ NN: {} cells  [{}]",
+                        valid, fmt_memory(memory_bytes)
+                    ));
+                }
+                // NeuralNetwork does not send Progress updates (single-shot).
+                #[cfg(feature = "neural")]
+                SimUpdate::Progress {
+                    strategy: Strategy::NeuralNetwork,
+                    ..
+                } => {}
             }
         }
 
         // Close channel once all active strategies have finished.
+        #[cfg(not(feature = "neural"))]
         let all_active = [Strategy::MonteCarlo, Strategy::ConstraintSearch];
+        #[cfg(feature = "neural")]
+        let all_active = [Strategy::MonteCarlo, Strategy::ConstraintSearch, Strategy::NeuralNetwork];
         if all_active.iter().all(|s| self.done_strategies.contains(s)) {
             self.prob_rx = None;
         }
@@ -287,6 +336,8 @@ impl MinesweeperGui {
             if game.state == GameState::Playing && game.mines_generated {
                 let game_clone = game.clone();
                 let game_clone2 = game_clone.clone();
+                #[cfg(feature = "neural")]
+                let game_clone3 = game_clone.clone();
 
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.prob_rx = Some(rx);
@@ -294,9 +345,14 @@ impl MinesweeperGui {
                 self.probs_priority = 0;
                 self.mc_has_data = false;
                 self.cs_has_data = false;
+                #[cfg(feature = "neural")] { self.nn_has_data = false; }
 
                 let mc_tx = tx.clone();
-                let cs_tx = tx;
+                let cs_tx = tx.clone();
+                #[cfg(feature = "neural")]
+                let nn_tx = tx;
+                #[cfg(not(feature = "neural"))]
+                drop(tx);
 
                 std::thread::spawn(move || {
                     MonteCarlo::new().calculate_with_progress(&game_clone, mc_tx);
@@ -304,6 +360,19 @@ impl MinesweeperGui {
                 std::thread::spawn(move || {
                     ConstraintSearch::new().calculate_with_progress(&game_clone2, cs_tx);
                 });
+
+                #[cfg(feature = "neural")]
+                {
+                    let model_path = self.nn_model_path.clone();
+                    std::thread::spawn(move || {
+                        match NeuralNetwork::new(&model_path) {
+                            Ok(nn) => nn.calculate_with_progress(&game_clone3, nn_tx),
+                            Err(e) => {
+                                eprintln!("NeuralNetwork load error: {e}");
+                            }
+                        }
+                    });
+                }
             }
         }
     }
@@ -378,6 +447,15 @@ impl MinesweeperGui {
                     let cs_prob_text = if is_hidden && self.cs_has_data {
                         format!("{:.0}%", cs_p * 100.0)
                     } else { String::new() };
+                    #[cfg(feature = "neural")]
+                    let nn_prob_text = {
+                        let nn_p = self.nn_probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(0.0);
+                        if is_hidden && self.nn_has_data {
+                            format!("{:.0}%", nn_p * 100.0)
+                        } else { String::new() }
+                    };
+                    #[cfg(not(feature = "neural"))]
+                    let nn_prob_text = String::new();
 
                     // A hidden cell is a "border" cell if it is adjacent to at least one
                     // visible numbered cell — i.e. it is directly constrained.
@@ -405,6 +483,7 @@ impl MinesweeperGui {
                     map.insert(QString::from("bgColor"), QString::from(bg_color).into());
                     map.insert(QString::from("mcProbText"), QString::from(mc_prob_text).into());
                     map.insert(QString::from("csProbText"), QString::from(cs_prob_text).into());
+                    map.insert(QString::from("nnProbText"), QString::from(nn_prob_text).into());
                     map.insert(QString::from("isBorder"), is_border.into());
                     new_cells.push(map.into());
                 }
@@ -544,6 +623,14 @@ ApplicationWindow {
             Layout.alignment: Qt.AlignHCenter
         }
 
+        Text {
+            visible: minesweeper.nn_status !== ""
+            text: minesweeper.nn_status
+            font.pixelSize: 11
+            color: "#468"
+            Layout.alignment: Qt.AlignHCenter
+        }
+
         GridLayout {
             columns: minesweeper.board_width
             columnSpacing: 2
@@ -587,6 +674,16 @@ ApplicationWindow {
                         anchors.margins: 1
                     }
 
+                    Text {
+                        visible: modelData.nnProbText !== "" && root.cellSize >= 14
+                        text: modelData.nnProbText
+                        font.pixelSize: 7
+                        color: "#468"
+                        anchors.bottom: parent.bottom
+                        anchors.left: parent.left
+                        anchors.margins: 1
+                    }
+
                     MouseArea {
                         anchors.fill: parent
                         hoverEnabled: true
@@ -594,8 +691,9 @@ ApplicationWindow {
                         onEntered: {
                             var mc = modelData.mcProbText
                             var cs = modelData.csProbText
-                            if (mc !== "" || cs !== "") {
-                                root.hoveredProb = "MC: " + (mc !== "" ? mc : "?") + "  |  CS: " + (cs !== "" ? cs : "?")
+                            var nn = modelData.nnProbText
+                            if (mc !== "" || cs !== "" || nn !== "") {
+                                root.hoveredProb = "MC: " + (mc !== "" ? mc : "?") + "  |  CS: " + (cs !== "" ? cs : "?") + "  |  NN: " + (nn !== "" ? nn : "?")
                             } else {
                                 root.hoveredProb = ""
                             }

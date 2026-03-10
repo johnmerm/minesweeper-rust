@@ -8,3 +8,14 @@ edition = "2021"
 rand = "0.8"
 
 serde = { version = "1.0", features = ["derive"] }
+
+[dependencies.tract-onnx]
+version = "0.21"
+optional = true
+
+[dependencies.anyhow]
+version = "1"
+optional = true
+
+[features]
+neural = ["tract-onnx", "anyhow"]

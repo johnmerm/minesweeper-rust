@@ -1,12 +1,10 @@
 [package]
-name = "gui"
+name = "datagen"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 minesweeper_core = { path = "../minesweeper_core" }
-qmetaobject = "0.2"
-cstr = "0.2"
-
-[features]
-neural = ["minesweeper_core/neural"]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rand = "0.8"

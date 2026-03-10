@@ -2,8 +2,10 @@ use crate::Minesweeper;
 
 pub mod monte_carlo;
 pub mod constraint_search;
+#[cfg(feature = "neural")] pub mod neural;
 pub use monte_carlo::MonteCarlo;
 pub use constraint_search::ConstraintSearch;
+#[cfg(feature = "neural")] pub use neural::NeuralNetwork;
 
 pub trait ProbabilityStrategy {
     fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>>;
@@ -13,6 +15,9 @@ pub trait ProbabilityStrategy {
 pub enum Strategy {
     MonteCarlo,
     ConstraintSearch,
+    /// Neural network estimator (ONNX), priority 1 — same as MC.
+    /// ConstraintSearch (priority 2) overrides it once it finishes.
+    #[cfg(feature = "neural")] NeuralNetwork,
 }
 
 impl Strategy {
@@ -22,6 +27,7 @@ impl Strategy {
         match self {
             Strategy::MonteCarlo => 1,
             Strategy::ConstraintSearch => 2,
+            #[cfg(feature = "neural")] Strategy::NeuralNetwork => 1,
         }
     }
 }

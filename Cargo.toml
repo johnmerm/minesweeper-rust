@@ -4,5 +4,6 @@ members = [
     "cli",
     "gui",
     "web",
+    "datagen",
 ]
 resolver = "2"
