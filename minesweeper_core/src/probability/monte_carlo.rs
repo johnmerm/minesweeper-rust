@@ -294,6 +294,8 @@ pub(crate) struct SimSetup {
     pub(crate) mines_to_place: usize,
     /// Cells proven to be mines by constraint propagation (always probability 1).
     pub(crate) certain_mines: Vec<(usize, usize)>,
+    /// Cells proven to be safe by constraint propagation (always probability 0).
+    pub(crate) certain_safe: Vec<(usize, usize)>,
 }
 
 impl SimSetup {
@@ -306,6 +308,15 @@ impl SimSetup {
             .collect();
 
         let n = all_hidden.len();
+
+        // Reverse lookup, board cell -> index into `all_hidden`. The neighbour
+        // scan below used to linear-search `all_hidden` for every neighbour of
+        // every visible cell, which is O(visible x hidden) and grows with board
+        // area — costly here because auto-reveal calls this repeatedly.
+        let mut hidden_index = vec![usize::MAX; game.width * game.height];
+        for (i, &(hx, hy)) in all_hidden.iter().enumerate() {
+            hidden_index[hy * game.width + hx] = i;
+        }
 
         let visible_mine_count = (0..game.height)
             .flat_map(|y| (0..game.width).map(move |x| (x, y)))
@@ -363,9 +374,8 @@ impl SimSetup {
                             game.grid[ny][nx].state,
                             CellState::Hidden | CellState::Flagged
                         ) {
-                            if let Some(idx) =
-                                all_hidden.iter().position(|&(hx, hy)| hx == nx && hy == ny)
-                            {
+                            let idx = hidden_index[ny * game.width + nx];
+                            if idx != usize::MAX {
                                 hidden_neighbor_indices.push(idx);
                             }
                         }
@@ -387,9 +397,14 @@ impl SimSetup {
             propagate(n, raw_constraints, mines_to_place);
 
         // Compact hidden_cells to only uncertain cells, re-indexing constraints.
-        let uncertain: Vec<usize> = (0..n)
-            .filter(|i| !certain_mine_idxs.contains(i) && !certain_safe_idxs.contains(i))
+        // Sets, not Vec::contains: propagation can determine most of the board,
+        // and the linear scans below are then quadratic in the hidden count.
+        let determined: HashSet<usize> = certain_mine_idxs
+            .iter()
+            .chain(certain_safe_idxs.iter())
+            .copied()
             .collect();
+        let uncertain: Vec<usize> = (0..n).filter(|i| !determined.contains(i)).collect();
 
         let mut old_to_new = vec![usize::MAX; n];
         for (new, &old) in uncertain.iter().enumerate() {
@@ -403,7 +418,7 @@ impl SimSetup {
             .filter_map(|(neighbors, required)| {
                 let new_neighbors: Vec<usize> = neighbors
                     .into_iter()
-                    .filter(|&i| !certain_mine_idxs.contains(&i) && !certain_safe_idxs.contains(&i))
+                    .filter(|i| !determined.contains(i))
                     .map(|i| old_to_new[i])
                     .collect();
                 if new_neighbors.is_empty() {
@@ -416,12 +431,15 @@ impl SimSetup {
 
         let certain_mines: Vec<(usize, usize)> =
             certain_mine_idxs.iter().map(|&i| all_hidden[i]).collect();
+        let certain_safe: Vec<(usize, usize)> =
+            certain_safe_idxs.iter().map(|&i| all_hidden[i]).collect();
 
         Some(Self {
             hidden_cells,
             constraints,
             mines_to_place,
             certain_mines,
+            certain_safe,
         })
     }
 }

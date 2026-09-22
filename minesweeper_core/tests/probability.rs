@@ -9,7 +9,7 @@
 //! Boards are built explicitly rather than through `Minesweeper::reveal`'s lazy
 //! generation, so every position here is reproducible without an RNG.
 
-use minesweeper_core::probability::{ConstraintSearch, ProbabilityStrategy};
+use minesweeper_core::probability::{certain_cells, ConstraintSearch, ProbabilityStrategy};
 use minesweeper_core::{CellContent, CellState, Minesweeper};
 
 /// Build a board with mines at the given coordinates and all numbers filled in,
@@ -238,6 +238,137 @@ fn probabilities_sum_to_remaining_mines() {
         "probabilities sum to {total}, expected {}",
         game.mines_count
     );
+}
+
+/// Deterministic PRNG, so the sweeps below are reproducible and need no dependency.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 33
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Build a random board and play it forward, revealing everything propagation
+/// proves safe and otherwise guessing a cell that happens not to be a mine, so
+/// the sweep reaches deep mid-game positions rather than dying on move three.
+fn sweep(seed: u64, width: usize, height: usize, mines: usize, mut check: impl FnMut(&Minesweeper)) {
+    let mut rng = Lcg(seed);
+    let mut placed: Vec<(usize, usize)> = Vec::new();
+    while placed.len() < mines {
+        let cell = (rng.below(width), rng.below(height));
+        if !placed.contains(&cell) {
+            placed.push(cell);
+        }
+    }
+    let mut game = board(width, height, &placed);
+
+    // Opening move: a cell that is not a mine.
+    let safe_start = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .find(|&(x, y)| !matches!(game.grid[y][x].content, CellContent::Mine))
+        .expect("board is entirely mines");
+    game.reveal(safe_start.0, safe_start.1);
+
+    for _ in 0..40 {
+        check(&game);
+
+        let proven = certain_cells(&game);
+        let opened: Vec<(usize, usize)> = proven
+            .safe
+            .iter()
+            .copied()
+            .filter(|&(x, y)| game.grid[y][x].state == CellState::Hidden)
+            .collect();
+        if !opened.is_empty() {
+            for (x, y) in opened {
+                game.reveal(x, y);
+            }
+            continue;
+        }
+
+        // Propagation is exhausted — guess a non-mine cell to make progress.
+        let guess = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                game.grid[y][x].state == CellState::Hidden
+                    && !matches!(game.grid[y][x].content, CellContent::Mine)
+            });
+        match guess {
+            Some((x, y)) => game.reveal(x, y),
+            None => break,
+        }
+    }
+}
+
+/// The safety property the auto-reveal feature now rests on: a cell that
+/// propagation calls safe is never a mine, and one it calls a mine always is.
+/// Checked across many random mid-game positions on boards far too large for the
+/// brute-force oracle.
+#[test]
+fn propagation_is_never_wrong() {
+    for seed in 0..40u64 {
+        sweep(seed * 7 + 1, 16, 16, 40, |game| {
+            let proven = certain_cells(game);
+            for &(x, y) in &proven.safe {
+                assert!(
+                    !matches!(game.grid[y][x].content, CellContent::Mine),
+                    "propagation called ({x}, {y}) safe but it is a mine"
+                );
+            }
+            for &(x, y) in &proven.mines {
+                assert!(
+                    matches!(game.grid[y][x].content, CellContent::Mine),
+                    "propagation called ({x}, {y}) a mine but it is not"
+                );
+            }
+        });
+    }
+}
+
+/// Same property on the board size that was hanging, where the estimators are
+/// too slow to consult but propagation still has to be right.
+#[test]
+fn propagation_is_never_wrong_on_a_dense_board() {
+    for seed in 0..12u64 {
+        sweep(seed * 13 + 5, 30, 30, 250, |game| {
+            for &(x, y) in &certain_cells(game).safe {
+                assert!(
+                    !matches!(game.grid[y][x].content, CellContent::Mine),
+                    "propagation called ({x}, {y}) safe but it is a mine"
+                );
+            }
+        });
+    }
+}
+
+/// Propagation is allowed to find less than the full search, but never something
+/// different: anything it proves must match the exact probabilities.
+#[test]
+fn propagation_agrees_with_the_exact_search() {
+    for seed in 0..15u64 {
+        sweep(seed * 11 + 3, 10, 10, 15, |game| {
+            let proven = certain_cells(game);
+            if proven.safe.is_empty() && proven.mines.is_empty() {
+                return;
+            }
+            let probs = ConstraintSearch::new().calculate(game);
+            for &(x, y) in &proven.safe {
+                assert_eq!(probs[y][x], 0.0, "({x}, {y}) proven safe but estimated non-zero");
+            }
+            for &(x, y) in &proven.mines {
+                assert_eq!(probs[y][x], 1.0, "({x}, {y}) proven a mine but not estimated 1.0");
+            }
+        });
+    }
 }
 
 /// A cell that is a mine in every consistent layout must read exactly 1.0, and

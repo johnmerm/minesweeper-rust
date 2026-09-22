@@ -11,6 +11,40 @@ pub trait ProbabilityStrategy {
     fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>>;
 }
 
+/// Cells whose contents follow from the visible numbers alone.
+///
+/// Returned by [`certain_cells`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CertainCells {
+    /// Unopened cells that must be mines.
+    pub mines: Vec<(usize, usize)>,
+    /// Unopened cells that cannot be mines, and are therefore safe to reveal.
+    pub safe: Vec<(usize, usize)>,
+}
+
+/// Cells that constraint propagation alone proves are mines or safe.
+///
+/// This is the cheap half of what the estimators do: it applies the local rules
+/// — "this 3 already touches 3 unopened cells, so they are all mines", "this 1
+/// already touches its mine, so its other neighbours are safe" — to a fixpoint,
+/// without enumerating or sampling any layout. It is polynomial where the
+/// estimators are exponential.
+///
+/// It is deliberately *incomplete*: a cell can be provably safe while no
+/// sequence of local rules shows it, and only a full search finds those. What it
+/// returns is always sound, though, so a caller can reveal every cell in `safe`
+/// without risk. Use it to make progress cheaply, and fall back to a full
+/// strategy when it runs dry.
+pub fn certain_cells(game: &Minesweeper) -> CertainCells {
+    match monte_carlo::SimSetup::build(game) {
+        Some(setup) => CertainCells {
+            mines: setup.certain_mines,
+            safe: setup.certain_safe,
+        },
+        None => CertainCells::default(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Strategy {
     MonteCarlo,

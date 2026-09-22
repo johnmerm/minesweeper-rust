@@ -30,7 +30,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 
-use minesweeper_core::probability::{ConstraintSearch, MonteCarlo, SimUpdate};
+use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, SimUpdate};
 use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
 
 mod rng;
@@ -140,9 +140,19 @@ impl AppState {
         }
     }
 
-    /// Reveal every cell the estimator considers certainly safe, recomputing
-    /// after each pass until nothing new is provably safe. Returns the number of
-    /// cells revealed. Mirrors the "auto-reveal" toggle of the Actix front-end.
+    /// Reveal every cell that can be proven safe, repeatedly, and return how
+    /// many were revealed.
+    ///
+    /// Each reveal changes the board, so this has to iterate — but re-running the
+    /// full estimator on every iteration is what made this hang: on a 30x30 board
+    /// with 250 mines one click took 47 passes at ~666 ms each, over 31 seconds,
+    /// because a half-open cascade front is the exact search's worst case.
+    ///
+    /// Instead, iterate on [`certain_cells`], which proves safety with local
+    /// rules only and costs no search, and pay for a full solve only once
+    /// propagation has run dry — that last step is what catches the cells only a
+    /// full enumeration can prove safe. In practice that turns dozens of solves
+    /// into one or two.
     fn auto_reveal(&mut self, mode: u32) -> u32 {
         if self.game.state != GameState::Playing || !self.game.mines_generated {
             return 0;
@@ -150,29 +160,50 @@ impl AppState {
 
         let mut revealed = 0;
         loop {
-            let safe: Vec<(usize, usize)> = (0..self.game.height)
-                .flat_map(|y| (0..self.game.width).map(move |x| (x, y)))
-                .filter(|&(x, y)| {
-                    self.game.grid[y][x].state == CellState::Hidden
-                        && self.probs[y * self.game.width + x] < 1e-9
-                })
-                .collect();
-            if safe.is_empty() {
-                break;
-            }
-            for (x, y) in safe {
-                self.game.reveal(x, y);
-                revealed += 1;
-            }
-            self.sync_cells();
-            // Recompute before testing for game over, so the probability buffer
-            // always describes the board JavaScript is about to draw.
-            self.compute(mode);
+            // Cheap: everything the local rules can prove, to a fixpoint.
+            let safe = certain_cells(&self.game).safe;
+            let opened = self.reveal_all(&safe);
+            revealed += opened;
             if self.game.state != GameState::Playing {
                 break;
             }
+            if opened > 0 {
+                continue;
+            }
+
+            // Propagation is exhausted, so it is worth one full solve to see
+            // whether anything else is provably safe.
+            self.sync_cells();
+            self.compute(mode);
+            let width = self.game.width;
+            let deduced: Vec<(usize, usize)> = (0..self.game.height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| self.probs[y * width + x] < 1e-9)
+                .collect();
+            let opened = self.reveal_all(&deduced);
+            revealed += opened;
+            if opened == 0 || self.game.state != GameState::Playing {
+                break;
+            }
         }
+
+        self.sync_cells();
+        // Leave the probability buffer describing the board JavaScript is about
+        // to draw, not the one we started from.
+        self.compute(mode);
         revealed
+    }
+
+    /// Reveal the still-hidden cells among `cells`, returning how many opened.
+    fn reveal_all(&mut self, cells: &[(usize, usize)]) -> u32 {
+        let mut opened = 0;
+        for &(x, y) in cells {
+            if self.game.grid[y][x].state == CellState::Hidden {
+                self.game.reveal(x, y);
+                opened += 1;
+            }
+        }
+        opened
     }
 }
 

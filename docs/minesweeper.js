@@ -220,7 +220,9 @@
     el.timer.textContent = '0:00';
     startedAt = 0;
     render();
-    el.sim.textContent = '';
+    // A fresh board still has a probability: mines / cells, the same for every
+    // square. Without this the grid would read 0% until the first click.
+    scheduleCompute();
   }
 
   function onCell(index, flag) {
