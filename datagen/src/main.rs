@@ -65,7 +65,7 @@ fn main() {
     let mut out = io::BufWriter::new(stdout.lock());
 
     let mut rng = rand::thread_rng();
-    let cs = ConstraintSearch::new();
+    let cs = ConstraintSearch::exhaustive();
     let mut generated = 0;
 
     while generated < n {

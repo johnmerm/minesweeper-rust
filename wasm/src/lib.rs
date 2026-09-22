@@ -175,6 +175,15 @@ impl AppState {
             // whether anything else is provably safe.
             self.sync_cells();
             self.compute(mode);
+
+            // Only the exact search proves anything. A sampled 0% just means no
+            // draw happened to put a mine there, and opening on that would
+            // eventually detonate one — so if the search bailed out and we are
+            // looking at a Monte Carlo estimate, stop here.
+            if self.stats[STAT_USED] != mode::CONSTRAINT_SEARCH {
+                break;
+            }
+
             let width = self.game.width;
             let deduced: Vec<(usize, usize)> = (0..self.game.height)
                 .flat_map(|y| (0..width).map(move |x| (x, y)))

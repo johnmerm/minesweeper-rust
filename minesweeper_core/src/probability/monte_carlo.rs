@@ -203,8 +203,19 @@ impl MonteCarlo {
         let mut b_indices: Vec<usize> = (0..b).collect();
         let mut attempt = 0;
 
+        // A draw is kept only if it satisfies every constraint at once, so the
+        // acceptance rate collapses as the board fills up. On a large board it
+        // reaches zero: the loop then spends its entire budget — a million draws,
+        // hundreds of milliseconds — to return nothing at all. Give it a fair
+        // chance and then stop, rather than making the player wait for a result
+        // that is not coming.
+        let give_up_after = self.max_attempts / 10;
+
         for _ in 0..self.max_attempts {
             if valid_count >= self.max_valid as u32 {
+                break;
+            }
+            if valid_count == 0 && attempt >= give_up_after {
                 break;
             }
 

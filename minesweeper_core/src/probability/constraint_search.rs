@@ -5,6 +5,7 @@ use crate::Minesweeper;
 
 use super::{ProbabilityStrategy, SimUpdate, Strategy};
 use super::monte_carlo::{SimSetup, build_probs, mc_memory_estimate};
+use super::MonteCarlo;
 
 /// Exact mine probability estimation using depth-first constraint enumeration.
 ///
@@ -46,11 +47,37 @@ use super::monte_carlo::{SimSetup, build_probs, mc_memory_estimate};
 ///   4. Accumulate weighted mine counts for every cell.
 ///
 /// Final probability for cell `c` = (sum of weights where c is a mine) / (total weight).
-pub struct ConstraintSearch;
+pub struct ConstraintSearch {
+    /// Search nodes to visit before giving up on being exact.
+    ///
+    /// The search is exponential in the size of the border, and on a dense board
+    /// a single position can hold billions of consistent layouts — one 30x30/250
+    /// position took over two minutes, which is indistinguishable from a hang.
+    /// Past this many nodes the search stops and reports no result, so the caller
+    /// falls back to sampling instead of waiting.
+    ///
+    /// Set it to `usize::MAX` for an unbounded, always-exact search when latency
+    /// does not matter (offline analysis, training-data generation).
+    pub max_nodes: usize,
+}
+
+/// Node budget that keeps a single solve inside a comfortable interactive
+/// frame on the boards measured here, while still finishing the vast majority
+/// of positions exactly.
+const DEFAULT_MAX_NODES: usize = 1_000_000;
 
 impl ConstraintSearch {
     pub fn new() -> Self {
-        Self
+        Self {
+            max_nodes: DEFAULT_MAX_NODES,
+        }
+    }
+
+    /// An unbounded search: always exact, however long it takes.
+    pub fn exhaustive() -> Self {
+        Self {
+            max_nodes: usize::MAX,
+        }
     }
 
     pub fn calculate_with_progress(&self, game: &Minesweeper, tx: Sender<SimUpdate>) {
@@ -126,6 +153,7 @@ impl ConstraintSearch {
                 &setup.constraints,
                 &interior,
                 setup.mines_to_place,
+                self.max_nodes,
                 send_progress,
             );
             // Start the DFS from constraint index 0 (root of the search tree).
@@ -134,12 +162,27 @@ impl ConstraintSearch {
             // Move results out before `dfs` (and its borrow of `tx`) is dropped.
             mine_counts = with_interior(&dfs.mine_counts, &interior, dfs.interior_weight);
             total_weight = dfs.total_weight;
-            valid_count = dfs.valid_count;
+            // A search that ran out of budget has a biased partial answer, so it
+            // reports nothing at all and the caller falls back to sampling.
+            //
+            // Zero total weight is reported the same way. It should not happen,
+            // but if it ever does, `build_probs` would hand back a grid of 0.0 —
+            // and 0.0 means "provably safe" to every caller, which is the one
+            // wrong answer that loses the game rather than merely looking odd.
+            valid_count = if dfs.exhausted || dfs.total_weight <= 0.0 {
+                0
+            } else {
+                dfs.valid_count
+            };
             step_count = dfs.step_count;
         } // ← `dfs` (and the `send_progress` closure holding `&tx`) dropped here.
 
         // Send the final exact probabilities.
-        let probs = build_probs(&mine_counts, total_weight, &setup, game.width, game.height);
+        let probs = if valid_count > 0 {
+            build_probs(&mine_counts, total_weight, &setup, game.width, game.height)
+        } else {
+            vec![vec![0.0; game.width]; game.height]
+        };
         let _ = tx.send(SimUpdate::Done {
             strategy: Strategy::ConstraintSearch,
             attempts: step_count,
@@ -170,9 +213,18 @@ impl ProbabilityStrategy for ConstraintSearch {
             &setup.constraints,
             &interior,
             setup.mines_to_place,
+            self.max_nodes,
             |_, _, _, _, _| true,
         );
         dfs.run(0);
+
+        if dfs.exhausted || dfs.total_weight <= 0.0 {
+            // No usable answer: either the walk was cut short (its partial numbers
+            // are biased) or every leaf weighed nothing. This signature has no way
+            // to say "no answer", and zeros would be read as proof of safety, so
+            // return a sampled estimate instead.
+            return MonteCarlo::new().calculate(game);
+        }
 
         let counts = with_interior(&dfs.mine_counts, &interior, dfs.interior_weight);
         build_probs(&counts, dfs.total_weight, &setup, game.width, game.height)
@@ -231,6 +283,16 @@ struct Dfs<'a, F> {
     on_progress: F,
     /// Set to `true` when `on_progress` returns `false`; causes all recursion to unwind.
     aborted: bool,
+    /// Nodes visited so far, against `max_nodes`.
+    nodes: usize,
+    /// Budget; see [`ConstraintSearch::max_nodes`].
+    max_nodes: usize,
+    /// Set when the budget ran out. The partial numbers are then worthless — a
+    /// half-finished depth-first walk has only covered a lexicographic prefix of
+    /// the layouts, so a cell can read 0% purely because its subtree was never
+    /// visited, which would be read as "provably safe". Callers must discard the
+    /// result rather than display it.
+    exhausted: bool,
 }
 
 impl<'a, F> Dfs<'a, F>
@@ -242,6 +304,7 @@ where
         constraints: &'a [(Vec<usize>, usize)],
         interior: &'a [usize],
         mines_total: usize,
+        max_nodes: usize,
         on_progress: F,
     ) -> Self {
         Self {
@@ -253,12 +316,22 @@ where
             border_mines: 0,
             mine_cells: Vec::new(),
             interior_weight: 0.0,
-            interior_ways: scaled_binomials(interior.len()),
+            // The search places between 0 and `n - interior` mines on border
+            // cells, so the interior takes the rest: that is the only range of
+            // interior counts the weights are ever asked for.
+            interior_ways: scaled_binomials(
+                interior.len(),
+                mines_total.saturating_sub(n - interior.len()),
+                mines_total.min(interior.len()),
+            ),
             total_weight: 0.0,
             valid_count: 0,
             step_count: 0,
             on_progress,
             aborted: false,
+            nodes: 0,
+            max_nodes,
+            exhausted: false,
         }
     }
 
@@ -266,6 +339,16 @@ where
     /// then call `run(constraint_idx + 1)`.  Backtracks when done.
     fn run(&mut self, constraint_idx: usize) {
         if self.aborted {
+            return;
+        }
+
+        // Budget check at every node, so a deep subtree that never reaches a leaf
+        // cannot run away — the old cancellation only fired every 500th *valid*
+        // leaf, which such a subtree never produces.
+        self.nodes += 1;
+        if self.nodes > self.max_nodes {
+            self.aborted = true;
+            self.exhausted = true;
             return;
         }
 
@@ -486,13 +569,21 @@ fn with_interior(border_counts: &[f64], interior: &[usize], share: f64) -> Vec<f
     counts
 }
 
-/// Weights `C(n, k)` for every k in `0..=n`, scaled so the largest is 1.
+/// Weights `C(n, k)` for every k in `0..=n`, rescaled to stay inside `f64`.
 ///
-/// Scaled because the true values overflow: `C(700, 200)` is around 10^200 and a
-/// bigger board saturates `f64` to infinity, which turns the final division into
-/// NaN. Only ratios between these weights are ever used, so dividing the table by
-/// its largest entry costs nothing and keeps every value finite.
-fn scaled_binomials(n: usize) -> Vec<f64> {
+/// The true values do not fit: `C(2400, 1200)` is about 10^722 and a bigger board
+/// saturates to infinity, which turns the final division into NaN. Only ratios
+/// between these weights are ever used, so the whole table can be divided by any
+/// constant — this one divides by the largest weight that the search can actually
+/// reach.
+///
+/// Which weight that is matters. Dividing by the largest entry *overall* looks
+/// natural and is wrong: on a sparse board the reachable `k` sits far out in the
+/// tail, and `exp(566 - 1663)` underflows to exactly zero. Every leaf then weighs
+/// nothing, the total comes out zero, and a grid of 0% reads as "all safe" — which
+/// is how this detonated auto-reveal on a 50x50 board. So the peak is taken over
+/// `k_min..=k_max`, the range of interior mine counts the caller can hit.
+fn scaled_binomials(n: usize, k_min: usize, k_max: usize) -> Vec<f64> {
     let mut ln_factorial = vec![0.0f64; n + 1];
     for i in 1..=n {
         ln_factorial[i] = ln_factorial[i - 1] + (i as f64).ln();
@@ -500,7 +591,15 @@ fn scaled_binomials(n: usize) -> Vec<f64> {
     let ln_weights: Vec<f64> = (0..=n)
         .map(|k| ln_factorial[n] - ln_factorial[k] - ln_factorial[n - k])
         .collect();
-    let peak = ln_weights.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    let peak = ln_weights
+        .iter()
+        .take(k_max.min(n) + 1)
+        .skip(k_min.min(n))
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    let peak = if peak.is_finite() { peak } else { 0.0 };
+
     ln_weights.iter().map(|&w| (w - peak).exp()).collect()
 }
 

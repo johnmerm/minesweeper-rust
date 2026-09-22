@@ -102,5 +102,53 @@ g.e.ms_new(1, 999, 99999);
 check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 50 && g.e.ms_mines() === 149,
       `${g.e.ms_width()}x${g.e.ms_height()}/${g.e.ms_mines()}`);
 
+// Auto-reveal only ever opens cells it claims are *proven* safe, so it must never
+// end a game. This is the whole-pipeline check: it covers the estimator, the
+// propagation fixpoint, and the rule that a sampled 0% is not proof of anything.
+// It has already caught one bug that unit tests could not see, where a scaling
+// error made every cell on a sparse board read 0% and auto-reveal walked onto a
+// mine. It also bounds how long a single click may take.
+{
+  let games = 0, opened = 0, detonations = 0, slowest = 0, slowestOn = '';
+  for (const [w, h, m] of [[30, 30, 250], [30, 16, 99], [50, 50, 400], [16, 16, 40], [50, 50, 150]]) {
+    for (let seed = 1; seed <= 4; seed++) {
+      const s = await load(seed, seed * 977);
+      s.e.ms_new(w, h, m);
+      s.e.ms_reveal(w >> 1, h >> 1);
+      games++;
+      for (let move = 1; move <= 20 && s.e.ms_state() === 0; move++) {
+        s.e.ms_compute(0);
+        const started = Date.now();
+        opened += s.e.ms_auto_reveal(0);
+        const took = Date.now() - started;
+        if (took > slowest) { slowest = took; slowestOn = `${w}x${h}/${m} seed ${seed}`; }
+        if (s.e.ms_state() === 2) { detonations++; break; }
+        if (s.e.ms_state() !== 0) break;
+        const cells = s.cells(), probs = s.probs();
+        let best = -1;
+        for (let i = 0; i < w * h; i++) if (cells[i] === HIDDEN && (best < 0 || probs[i] < probs[best])) best = i;
+        if (best < 0) break;
+        s.e.ms_reveal(best % w, Math.floor(best / w));
+      }
+    }
+  }
+  check('auto-reveal never opens a mine', detonations === 0,
+        `${games} games, ${opened} cells opened, ${detonations} detonations`);
+  check('no single auto-reveal stalls the page', slowest < 5000, `worst ${slowest}ms on ${slowestOn}`);
+}
+
+// A grid that reads 0% everywhere would mean "all safe"; the estimates must
+// always account for exactly the mines that are left.
+{
+  const s = await load(1, 2);
+  s.e.ms_new(50, 50, 150);
+  s.e.ms_reveal(25, 25);
+  s.e.ms_compute(0);
+  const cells = s.cells(), probs = s.probs();
+  let sum = 0;
+  for (let i = 0; i < 2500; i++) if (cells[i] === HIDDEN || cells[i] === FLAGGED) sum += probs[i];
+  check('a large sparse board stays calibrated', Math.abs(sum - 150) < 0.5, `sum ${sum.toFixed(2)} vs 150`);
+}
+
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

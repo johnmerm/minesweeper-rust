@@ -388,3 +388,45 @@ fn certain_cells_are_exact() {
     assert_eq!(probs[1][0], 0.0, "a certain safe cell must read exactly 0.0");
     assert_eq!(probs[2][0], 0.0, "a certain safe cell must read exactly 0.0");
 }
+
+/// Regression: a sparse 50x50 board detonated auto-reveal in the wasm front-end,
+/// which only ever opens cells propagation calls safe.
+#[test]
+fn propagation_is_never_wrong_on_a_large_sparse_board() {
+    for seed in 0..6u64 {
+        sweep(seed * 977 + 1, 50, 50, 150, |game| {
+            for &(x, y) in &certain_cells(game).safe {
+                assert!(
+                    !matches!(game.grid[y][x].content, CellContent::Mine),
+                    "propagation called ({x}, {y}) safe but it is a mine"
+                );
+            }
+        });
+    }
+}
+
+/// Regression for a scaling bug that made every cell on a large sparse board
+/// read 0%. The leaf weights were divided by the largest binomial in the table
+/// rather than the largest one the search can reach, so the weights that were
+/// actually used underflowed to zero. A grid of zeros means "all safe", which
+/// detonated auto-reveal.
+///
+/// The mines-sum invariant catches it immediately: however the weights are
+/// scaled, the estimates must still add up to the mines that are out there.
+#[test]
+fn probabilities_stay_calibrated_on_large_boards() {
+    for (width, height, mines) in [(50, 50, 150), (40, 40, 60), (30, 30, 99)] {
+        sweep(width as u64 * 31 + mines as u64, width, height, mines, |game| {
+            let probs = ConstraintSearch::new().calculate(game);
+            let total: f64 = (0..game.height)
+                .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| game.grid[y][x].state != CellState::Visible)
+                .map(|(x, y)| probs[y][x])
+                .sum();
+            assert!(
+                (total - mines as f64).abs() < 0.01,
+                "{width}x{height}/{mines}: probabilities sum to {total:.4}, expected {mines}"
+            );
+        });
+    }
+}
