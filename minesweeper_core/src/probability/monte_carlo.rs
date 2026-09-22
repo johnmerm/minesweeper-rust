@@ -327,9 +327,13 @@ impl SimSetup {
                 if game.grid[y][x].state != CellState::Visible {
                     return None;
                 }
+                // A zero counts too: "none of my neighbours is a mine" is just as
+                // strong a constraint as any other number. A cascade normally
+                // leaves a 0 with no hidden neighbours, but a board restored from
+                // a snapshot carries no such guarantee, so don't rely on it.
                 let total = match game.grid[y][x].content {
-                    CellContent::Empty(n) if n > 0 => n as usize,
-                    _ => return None,
+                    CellContent::Empty(n) => n as usize,
+                    CellContent::Mine => return None,
                 };
 
                 let mut visible_mine_neighbors = 0usize;
@@ -369,7 +373,8 @@ impl SimSetup {
                 }
 
                 let required = total.saturating_sub(visible_mine_neighbors);
-                if required > hidden_neighbor_indices.len() {
+                // A cell with nothing hidden around it constrains nothing.
+                if hidden_neighbor_indices.is_empty() || required > hidden_neighbor_indices.len() {
                     None
                 } else {
                     Some((hidden_neighbor_indices, required))
