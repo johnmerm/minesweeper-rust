@@ -98,9 +98,26 @@ check('seeding is deterministic', a === b);
 check('different seeds give different boards', a !== c);
 check('mine count is honoured', [...a].filter((ch) => ch === '*').length === 10);
 
-g.e.ms_new(1, 999, 99999);
-check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 50 && g.e.ms_mines() === 149,
+// Nonsense dimensions are clamped rather than rejected: 200 a side, and never
+// so many mines that the board has no safe cell left.
+g.e.ms_new(1, 9999, 99999);
+check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 && g.e.ms_mines() === 599,
       `${g.e.ms_width()}x${g.e.ms_height()}/${g.e.ms_mines()}`);
+
+// A board well past the old 50x50 ceiling has to stay playable.
+{
+  const big = await load(11, 13);
+  big.e.ms_new(120, 120, 1800);
+  const started = Date.now();
+  big.e.ms_reveal(60, 60);
+  big.e.ms_compute(0);
+  const took = Date.now() - started;
+  const cells = big.cells(), probs = big.probs();
+  let sum = 0;
+  for (let i = 0; i < 120 * 120; i++) if (cells[i] === HIDDEN || cells[i] === FLAGGED) sum += probs[i];
+  check('a 120x120 board works', big.e.ms_width() === 120 && Math.abs(sum - 1800) < 1,
+        `first move ${took}ms, probabilities sum to ${sum.toFixed(1)} vs 1800`);
+}
 
 // Auto-reveal only ever opens cells it claims are *proven* safe, so it must never
 // end a game. This is the whole-pipeline check: it covers the estimator, the
@@ -135,6 +152,41 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 50 &&
   check('auto-reveal never opens a mine', detonations === 0,
         `${games} games, ${opened} cells opened, ${detonations} detonations`);
   check('no single auto-reveal stalls the page', slowest < 5000, `worst ${slowest}ms on ${slowestOn}`);
+}
+
+// Auto-play also flags the cells it proves are mines. Checking that is easy once
+// the game is lost: losing reveals every mine, turning a correctly flagged cell
+// into a revealed mine. Any cell still showing a flag was flagged wrongly.
+{
+  let flagged = 0, wrong = 0, games = 0;
+  for (const [w, h, m] of [[16, 16, 40], [30, 16, 99], [30, 30, 250]]) {
+    for (let seed = 1; seed <= 4; seed++) {
+      const s = await load(seed * 7, seed);
+      s.e.ms_new(w, h, m);
+      s.e.ms_reveal(w >> 1, h >> 1);
+      games++;
+      for (let move = 1; move <= 12 && s.e.ms_state() === 0; move++) {
+        s.e.ms_compute(0);
+        s.e.ms_auto_reveal(0);
+        if (s.e.ms_state() !== 0) break;
+        const cells = s.cells(), probs = s.probs();
+        let best = -1;
+        for (let i = 0; i < w * h; i++) if (cells[i] === HIDDEN && (best < 0 || probs[i] < probs[best])) best = i;
+        if (best < 0) break;
+        s.e.ms_reveal(best % w, Math.floor(best / w));
+      }
+      flagged += s.e.ms_flags();
+      // Force the game to end so every mine is revealed.
+      for (let i = 0; i < w * h && s.e.ms_state() === 0; i++) {
+        if (s.cells()[i] === HIDDEN) s.e.ms_reveal(i % w, Math.floor(i / w));
+      }
+      if (s.e.ms_state() === 2) {
+        for (const code of s.cells()) if (code === FLAGGED) wrong++;
+      }
+    }
+  }
+  check('auto-play only flags actual mines', wrong === 0,
+        `${games} games, ${flagged} flags placed, ${wrong} on non-mines`);
 }
 
 // A grid that reads 0% everywhere would mean "all safe"; the estimates must

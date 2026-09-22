@@ -1,21 +1,58 @@
 #!/usr/bin/env python3
-"""Generate docs/standalone.html: index.html with the JS and .wasm inlined.
+"""Stamp docs/index.html with a build id and generate docs/standalone.html.
 
-The result is a single self-contained file that needs no HTTP server at all —
-handy for file:// use or for mailing the game to someone. index.html itself
-stays a normal three-file page so diffs remain readable.
+Two jobs, both about the fact that these files are served straight from a CDN:
+
+1. **Stamping.** index.html references minesweeper.js by bare name, so a browser
+   or raw.githack.com will happily keep serving an old copy next to a new .wasm —
+   they are separate URLs with separate cache entries and nothing tells either one
+   that the content moved. Every reference gets `?v=<id>`, and the page displays
+   the id, so "am I actually running the new build?" is answerable at a glance
+   rather than by guesswork.
+
+   The id is a hash of the built files, not a timestamp or a commit: rebuilding
+   unchanged sources reproduces it exactly, so the build never dirties the tree.
+
+2. **standalone.html**, which inlines the script and the module as base64 into a
+   single self-contained file that runs from a file:// URL with no server at all.
+   index.html itself stays a normal three-file page so diffs remain readable.
 """
 import base64
+import hashlib
 import pathlib
+import re
 import sys
 
 docs = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "docs")
 
 html = (docs / "index.html").read_text(encoding="utf-8")
 js = (docs / "minesweeper.js").read_text(encoding="utf-8")
-wasm_b64 = base64.b64encode((docs / "minesweeper.wasm").read_bytes()).decode("ascii")
+wasm_bytes = (docs / "minesweeper.wasm").read_bytes()
+wasm_b64 = base64.b64encode(wasm_bytes).decode("ascii")
 
-placeholder = '<script src="minesweeper.js"></script>'
+build = hashlib.sha256(js.encode("utf-8") + wasm_bytes).hexdigest()[:8]
+
+# Rewrite rather than append, so re-running over an already-stamped file replaces
+# the previous id instead of accumulating query strings.
+html, declared = re.subn(
+    r'var MINESWEEPER_BUILD = "[^"]*";',
+    f'var MINESWEEPER_BUILD = "{build}";',
+    html,
+)
+html, referenced = re.subn(
+    r'(<script src="minesweeper\.js)(\?v=[^"]*)?(")',
+    rf'\1?v={build}\3',
+    html,
+)
+if not declared or not referenced:
+    raise SystemExit(
+        "index.html no longer has the MINESWEEPER_BUILD declaration or the "
+        "minesweeper.js reference that bundle.py stamps; update bundle.py"
+    )
+(docs / "index.html").write_text(html, encoding="utf-8")
+print(f"build {build}")
+
+placeholder = f'<script src="minesweeper.js?v={build}"></script>'
 if placeholder not in html:
     raise SystemExit("index.html no longer references minesweeper.js; update bundle.py")
 

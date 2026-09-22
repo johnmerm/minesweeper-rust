@@ -12,6 +12,13 @@ whole glue layer.
 | `minesweeper.wasm` | Built artifact, committed so the site needs no build step |
 | `standalone.html` | Generated: the above three inlined into one file |
 
+`index.html` carries a build id — a hash of the built script and module — which
+is shown at the bottom of the page and appended to both asset URLs. These files
+are served from a CDN, so without it a browser can quietly keep an old
+`minesweeper.js` beside a new `minesweeper.wasm`; with it, a page and the code it
+loads always match, and the stamp answers "am I running the new build?" at a
+glance.
+
 ## Playing it
 
 Served from any static host. Straight from GitHub via **raw.githack.com**:
@@ -22,6 +29,10 @@ https://raw.githack.com/johnmerm/minesweeper-rust/main/docs/index.html
 
 Swap `main` for a branch or tag name to open that version, and use
 `rawcdn.githack.com` instead for the cached, rate-limit-free CDN copy.
+
+githack caches, so a freshly pushed build may not appear at once: hard-reload
+(Ctrl/Cmd-Shift-R), and check the build id at the foot of the page against the
+one `./wasm/build.sh` printed.
 
 `standalone.html` carries the module inlined as base64, so that one file also
 runs from a `file://` URL — download it and double-click it. `index.html` needs
@@ -66,5 +77,9 @@ It drives the same ABI the page uses — no npm install needed.
   sampling only when the search finds no valid layout. The line under the board
   reports how much work each one did; the highlighted line is the one being
   displayed.
-- **Auto-reveal safe cells** opens every cell the estimator proves safe (0%),
-  re-running after each pass until nothing new is provable.
+- **Auto-play deductions** opens every cell proven safe (0%) and flags every cell
+  proven to be a mine (100%), repeating until nothing further follows. It only
+  acts on proof — never on a sampled estimate, where 0% merely means no sample
+  happened to put a mine there.
+- Boards go up to 200 a side. That ceiling is about the browser, not the engine:
+  every cell is a DOM node, and 200x200 is 40 000 of them.

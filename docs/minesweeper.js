@@ -22,6 +22,7 @@
 
   var wasm = null;          // the module's exports
   var cellEls = [];         // one DOM node per board cell, rebuilt on new game
+  var painted = [];         // what each cell currently shows, to skip no-op writes
   var width = 0, height = 0;
   var showProbs = true, autoReveal = false, flagMode = false;
   var pendingCompute = null;
@@ -43,6 +44,19 @@
 
   /* ---------------------------------------------------------------- loading */
 
+  /**
+   * Which build this is, stamped into index.html by wasm/bundle.py.
+   *
+   * Reported on the page because these files are served from a CDN: when a fix
+   * appears not to have landed, the first question is always whether the browser
+   * is even running the new build, and this answers it without guesswork.
+   */
+  function buildId() {
+    return typeof MINESWEEPER_BUILD === 'string' && MINESWEEPER_BUILD !== 'dev'
+      ? MINESWEEPER_BUILD
+      : '';
+  }
+
   function base64ToBytes(b64) {
     var bin = atob(b64);
     var bytes = new Uint8Array(bin.length);
@@ -56,7 +70,9 @@
     }
     // Deliberately not instantiateStreaming: some static hosts serve .wasm with
     // the wrong Content-Type, which streaming instantiation rejects outright.
-    return fetch('minesweeper.wasm')
+    // The build id keeps the module in step with this script — without it a CDN
+    // can serve a cached script beside a fresh module, or the reverse.
+    return fetch('minesweeper.wasm' + (buildId() ? '?v=' + buildId() : ''))
       .then(function (r) {
         if (!r.ok) throw new Error('HTTP ' + r.status + ' fetching minesweeper.wasm');
         return r.arrayBuffer();
@@ -93,6 +109,7 @@
     el.grid.style.gridTemplateColumns = 'repeat(' + width + ', var(--cell))';
     el.grid.textContent = '';
     cellEls = new Array(width * height);
+    painted = new Array(width * height);
 
     var frag = document.createDocumentFragment();
     for (var i = 0; i < width * height; i++) {
@@ -120,7 +137,7 @@
     var over = wasm.ms_state() !== 0;
 
     for (var i = 0; i < cellEls.length; i++) {
-      var node = cellEls[i], code = c[i], label = node.lastChild;
+      var code = c[i];
       var text = '', cls = 'cell', bg = '', pct = '';
 
       if (code === HIDDEN || code === FLAGGED) {
@@ -136,6 +153,16 @@
         text = code > 0 ? String(code) : '';
       }
 
+      // Touching the DOM for a cell that already looks right is what made a big
+      // board crawl: a move changes a handful of cells, but repainting all of
+      // them cost seconds on a 120x120 grid — far more than the estimator did.
+      var shown = cls + '\u0000' + bg + '\u0000' + text + '\u0000' + (over ? '' : pct);
+      if (painted[i] === shown) {
+        continue;
+      }
+      painted[i] = shown;
+
+      var node = cellEls[i], label = node.lastChild;
       node.className = cls;
       node.style.backgroundColor = bg;
       node.title = pct ? 'Mine: ' + pct : '';
@@ -317,6 +344,11 @@
 
   /* ------------------------------------------------------------------ start */
 
+  function showBuild() {
+    var stamp = document.getElementById('build');
+    if (stamp) stamp.textContent = buildId() ? 'build ' + buildId() : 'unversioned build';
+  }
+
   loadWasm().then(function (result) {
     wasm = result.instance.exports;
 
@@ -331,6 +363,7 @@
     wasm.ms_seed(seed[0], seed[1]);
 
     wireEvents();
+    showBuild();
     newGame(10, 10, 10);
   }).catch(fail);
 })();

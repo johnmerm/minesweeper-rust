@@ -103,10 +103,19 @@ and no bundler** so the result can be served as static files from any host
   as base64 for `file://` use. Run `./wasm/build.sh` and commit the regenerated
   artifacts whenever the core or the wasm crate changes — the site is served
   straight from the repository, so a stale `.wasm` ships stale gameplay.
-- Everything runs on the browser's main thread. The estimators are fast enough
-  (single-digit milliseconds even on a 30×16/99 board), but `scheduleCompute` in
-  `minesweeper.js` still defers them past the repaint so a click never blocks on
-  the calculation.
+- Everything runs on the browser's main thread, so both ends are bounded:
+  `ConstraintSearch` has a node budget (past it, it reports nothing and the caller
+  falls back to sampling), and `scheduleCompute` in `minesweeper.js` defers the
+  calculation past the repaint so a click never blocks on it.
+- `render` skips cells whose appearance has not changed. On a 120×120 board
+  repainting all 14 400 every move cost seconds — far more than the estimators.
+- `wasm/bundle.py` stamps `index.html` with a hash of the built script and module,
+  appends it to both asset URLs and shows it on the page. These files are served
+  straight from a CDN, so without it a stale `minesweeper.js` can be paired with a
+  fresh `.wasm`. The id is content-derived, so an unchanged rebuild is a no-op in
+  the diff — never replace it with a timestamp or a commit hash.
+- `MAX_DIM` caps boards at 200 a side. That is a guard on DOM size, not an engine
+  limit.
 
 ---
 
@@ -139,6 +148,10 @@ required); run it after `./wasm/build.sh`.
 ### Adding features to the core
 
 - All game-rule changes belong in `minesweeper_core/src/lib.rs`. Front-ends must not implement game logic themselves.
+- `probability::certain_cells` returns what constraint propagation alone proves —
+  mines and safe cells — without any search. It is the cheap way to make progress:
+  auto-play iterates on it and pays for a full solve only once it runs dry. It is
+  sound but incomplete, so a caller must never read "not proven" as "not certain".
 - Public API surface: `reveal`, `toggle_flag`, `calculate_mine_probabilities`, and read access to `grid`, `state`, `mines_count`, `width`, `height`, `mines_generated`.
 - Preserve the **lazy mine generation** invariant: mines must not be placed until the first `reveal` call, and the first-clicked cell must never be a mine.
 - `CellContent` uses `#[serde(untagged)]` so `Empty(n)` serialises as the bare integer `n` and `Mine` serialises as the string `"Mine"`. The web template relies on this; do not change the representation without updating the template.

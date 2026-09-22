@@ -65,8 +65,13 @@ mod cell_code {
     pub const FLAGGED: u8 = 11;
 }
 
-/// Largest board we accept, mirroring the clamp used by the Actix front-end.
-const MAX_DIM: usize = 50;
+/// Largest board dimension we accept.
+///
+/// Not a limit of the engine — it is a guard against a typo asking for a board
+/// with a million cells, each of which becomes a DOM node. 200x200 is 40 000
+/// cells, which is already slow to lay out; the estimators cope, since they are
+/// bounded and mostly care about the border rather than the area.
+const MAX_DIM: usize = 200;
 
 struct AppState {
     game: Minesweeper,
@@ -160,13 +165,18 @@ impl AppState {
 
         let mut revealed = 0;
         loop {
-            // Cheap: everything the local rules can prove, to a fixpoint.
-            let safe = certain_cells(&self.game).safe;
-            let opened = self.reveal_all(&safe);
+            // Cheap: everything the local rules can prove, to a fixpoint. Cells
+            // proven to *be* mines get flagged — the same deduction, and the
+            // player would only have to make it again by hand.
+            let proven = certain_cells(&self.game);
+            self.flag_all(&proven.mines);
+            let opened = self.reveal_all(&proven.safe);
             revealed += opened;
             if self.game.state != GameState::Playing {
                 break;
             }
+            // Only a reveal is progress: a flag tells the estimator nothing it
+            // did not already know, so looping on flags alone would never end.
             if opened > 0 {
                 continue;
             }
@@ -185,6 +195,12 @@ impl AppState {
             }
 
             let width = self.game.width;
+            let certain: Vec<(usize, usize)> = (0..self.game.height)
+                .flat_map(|y| (0..width).map(move |x| (x, y)))
+                .filter(|&(x, y)| self.probs[y * width + x] > 1.0 - 1e-9)
+                .collect();
+            self.flag_all(&certain);
+
             let deduced: Vec<(usize, usize)> = (0..self.game.height)
                 .flat_map(|y| (0..width).map(move |x| (x, y)))
                 .filter(|&(x, y)| self.probs[y * width + x] < 1e-9)
@@ -201,6 +217,21 @@ impl AppState {
         // to draw, not the one we started from.
         self.compute(mode);
         revealed
+    }
+
+    /// Flag the still-hidden cells among `cells`, returning how many were flagged.
+    ///
+    /// Only hidden ones: `toggle_flag` would otherwise clear a flag already
+    /// standing on the cell, undoing the deduction instead of recording it.
+    fn flag_all(&mut self, cells: &[(usize, usize)]) -> u32 {
+        let mut flagged = 0;
+        for &(x, y) in cells {
+            if self.game.grid[y][x].state == CellState::Hidden {
+                self.game.toggle_flag(x, y);
+                flagged += 1;
+            }
+        }
+        flagged
     }
 
     /// Reveal the still-hidden cells among `cells`, returning how many opened.
