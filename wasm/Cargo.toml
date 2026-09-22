@@ -1,0 +1,16 @@
+[package]
+name = "minesweeper_wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly front-end for the Minesweeper engine (no bundler, no server)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+minesweeper_core = { path = "../minesweeper_core" }
+
+# `custom` lets us feed randomness in from JavaScript instead of pulling in
+# wasm-bindgen: the whole point of this crate is a plain `WebAssembly.instantiate`
+# module with no generated JS glue.
+getrandom = { version = "0.2", features = ["custom"] }

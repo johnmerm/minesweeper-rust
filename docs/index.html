@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minesweeper — Rust / WebAssembly</title>
+<!-- Inline favicon: keeps the page to the three files it actually needs. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23ccc'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%23222'/%3E%3Cpath d='M16 2v6M16 24v6M2 16h6M24 16h6' stroke='%23222' stroke-width='3'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f0f0f0;
+    --panel: #fff;
+    --ink: #222;
+    --muted: #777;
+    --frame: #999;
+    --cell: 30px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 12px 40px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: flex; flex-direction: column; align-items: center;
+  }
+  h1 { font-size: 22px; margin: 0 0 2px; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+
+  .status { font-size: 18px; font-weight: 600; min-height: 1.4em; margin-bottom: 10px; }
+  .status.won  { color: #1a7f37; }
+  .status.lost { color: #c1121f; }
+
+  .scoreboard {
+    display: flex; gap: 18px; align-items: center; justify-content: center;
+    font-variant-numeric: tabular-nums; font-size: 15px; margin-bottom: 10px;
+  }
+  .scoreboard span { color: var(--muted); }
+  .scoreboard b { color: var(--ink); }
+
+  .grid {
+    display: grid; gap: 2px; padding: 5px;
+    background: var(--frame); border: 5px solid #666;
+    touch-action: manipulation;
+  }
+  .cell {
+    width: var(--cell); height: var(--cell);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    font-weight: bold; font-size: 17px; line-height: 1;
+    user-select: none; -webkit-user-select: none;
+    padding: 0; margin: 0; font-family: inherit;
+  }
+  .cell.hidden  { background: #ccc; border: 2px outset #eee; cursor: pointer; }
+  .cell.flagged { background: #ccc; border: 2px outset #eee; cursor: pointer; color: #c1121f; }
+  .cell.visible { background: #eee; border: 1px solid var(--frame); cursor: default; }
+  .cell.mine    { background: #e5383b; color: #fff; }
+  .cell.hidden:hover, .cell.flagged:hover { filter: brightness(1.08); }
+  .n1 { color: #0000ff; } .n2 { color: #007b00; } .n3 { color: #e00000; }
+  .n4 { color: #00007b; } .n5 { color: #7b0000; } .n6 { color: #008080; }
+  .n7 { color: #000; }    .n8 { color: #808080; }
+  .prob {
+    position: absolute; bottom: 0; right: 2px;
+    font-size: 8px; font-weight: 600; color: #444;
+    pointer-events: none; letter-spacing: -0.3px;
+  }
+  .grid.no-prob .prob { display: none; }
+
+  #hover { margin-top: 10px; font-size: 14px; color: #555; min-height: 1.4em; }
+  .sim { margin-top: 2px; font-size: 11px; line-height: 1.6; text-align: center; color: #888; }
+  .sim .used { color: #335; font-weight: 600; }
+
+  .panel {
+    margin-top: 16px; padding: 12px 16px;
+    background: var(--panel); border: 1px solid #ddd; border-radius: 8px;
+    display: flex; flex-wrap: wrap; gap: 10px 14px;
+    align-items: center; justify-content: center; max-width: 640px;
+  }
+  .panel label { font-size: 13px; display: inline-flex; align-items: center; gap: 4px; }
+  .panel input[type=number] { width: 54px; font: inherit; font-size: 13px; padding: 3px; }
+  .panel select { font: inherit; font-size: 13px; padding: 3px; }
+  button {
+    font: inherit; font-size: 14px; padding: 6px 14px; cursor: pointer;
+    border: 1px solid #bbb; border-radius: 6px; background: #fafafa;
+  }
+  button:hover { background: #f0f0f0; }
+  button.on { background: #c8f0c8; border-color: #8cc98c; }
+  .preset { padding: 4px 10px; font-size: 13px; }
+  .hint { margin-top: 14px; font-size: 12px; color: var(--muted); text-align: center; }
+  .hint code { background: #e6e6e6; padding: 1px 4px; border-radius: 3px; }
+  #error { color: #c1121f; font-size: 14px; max-width: 520px; text-align: center; }
+</style>
+</head>
+<body>
+
+<h1>Minesweeper</h1>
+<div class="subtitle">Rust engine compiled to WebAssembly &middot; runs entirely in your browser</div>
+
+<div id="error" hidden></div>
+
+<div class="status" id="status">Loading…</div>
+
+<div class="scoreboard">
+  <div><span>Mines</span> <b id="mines-left">–</b></div>
+  <div><span>Time</span> <b id="timer">0:00</b></div>
+</div>
+
+<div class="grid" id="grid" oncontextmenu="return false"></div>
+
+<div id="hover"></div>
+<div class="sim" id="sim"></div>
+
+<div class="panel">
+  <label>W <input type="number" id="in-width"  value="10" min="3" max="50"></label>
+  <label>H <input type="number" id="in-height" value="10" min="3" max="50"></label>
+  <label>Mines <input type="number" id="in-mines" value="10" min="1" max="2499"></label>
+  <button id="btn-new">New game</button>
+  <button class="preset" data-w="9"  data-h="9"  data-m="10">Beginner</button>
+  <button class="preset" data-w="16" data-h="16" data-m="40">Intermediate</button>
+  <button class="preset" data-w="30" data-h="16" data-m="99">Expert</button>
+</div>
+
+<div class="panel">
+  <label>Estimator
+    <select id="in-strategy">
+      <option value="0">Auto (exact, else sampled)</option>
+      <option value="2">Constraint search (exact)</option>
+      <option value="1">Monte Carlo (sampled)</option>
+    </select>
+  </label>
+  <button id="btn-probs" class="on">Show probabilities</button>
+  <button id="btn-auto">Auto-reveal safe cells</button>
+  <button id="btn-flagmode">Flag mode</button>
+</div>
+
+<p class="hint">
+  Left click reveals &middot; right click (or <em>flag mode</em>) flags.<br>
+  Cells are tinted from grey to red by the estimated chance they hide a mine.
+</p>
+
+<script src="minesweeper.js"></script>
+</body>
+</html>
