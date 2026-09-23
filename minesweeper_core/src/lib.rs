@@ -3,7 +3,7 @@ use std::fmt;
 use serde::Serialize;
 
 pub mod probability;
-use probability::{MonteCarlo, ProbabilityStrategy};
+use probability::{ConstraintSearch, ProbabilityStrategy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CellState {
@@ -215,11 +215,20 @@ impl Minesweeper {
 }
 
 impl Minesweeper {
-    /// Estimates the probability that each unopened cell contains a mine.
-    /// Delegates to [`MonteCarlo`] by default.
-    pub fn calculate_mine_probabilities
-    (&self) -> Vec<Vec<f64>> {
-        MonteCarlo::new().calculate(self)
+    /// The probability that each unopened cell contains a mine.
+    ///
+    /// Exact wherever the board allows it: [`ConstraintSearch`] enumerates the
+    /// consistent mine layouts and falls back to sampling on its own only when a
+    /// position is too tangled to finish within its budget. It used to delegate
+    /// straight to [`MonteCarlo`], which is now both slower and less accurate —
+    /// every front-end had already stopped using this method for that reason,
+    /// which left the one documented entry point as the worst way in.
+    ///
+    /// Callers that make many moves should keep a [`ConstraintSearch`] instead of
+    /// calling this: it caches its work between boards, and a fresh one per call
+    /// throws that away.
+    pub fn calculate_mine_probabilities(&self) -> Vec<Vec<f64>> {
+        ConstraintSearch::new().calculate(self)
     }
 }
 

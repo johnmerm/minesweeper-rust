@@ -27,28 +27,54 @@ The single source of truth for all game state and logic.
 | `Minesweeper` | The board: `grid: Vec<Vec<Cell>>`, dimensions, mine count, game state |
 | `Minesweeper::reveal` | Reveals a cell; generates mines lazily on the first call (safe-first-click guarantee) |
 | `Minesweeper::toggle_flag` | Cycles `Hidden ↔ Flagged` |
-| `Minesweeper::calculate_mine_probabilities` | Monte Carlo probability estimator – see below |
+| `Minesweeper::calculate_mine_probabilities` | Exact probability estimator – see below |
 
 #### Mine probability estimator
 
 `calculate_mine_probabilities(&self) -> Vec<Vec<f64>>`
 
-Uses random sampling to estimate the probability that each unopened cell contains a mine:
+Returns, for every unopened cell, the fraction of consistent mine layouts in which
+it holds a mine. Exact, not sampled:
 
-1. Collects all `Hidden`/`Flagged` cells as candidates.
-2. Builds constraints from every visible numbered cell: the count of mine-candidates among its neighbours must equal its displayed number (minus any already-visible mines).
-3. Repeatedly draws a random subset of `mines_count` candidates (partial Fisher-Yates), validates all constraints, and tallies per-cell mine counts across valid draws.
-4. Stops after **10 000 valid distributions** or **1 000 000 total attempts**, whichever comes first.
-5. Returns `mine_count[cell] / valid_distributions` for each cell (0.0 for visible cells).
+1. `SimSetup::build` collects the unopened cells and turns every visible number
+   into a constraint over its unopened neighbours, then runs `propagate` to settle
+   whatever local rules alone can settle.
+2. `components::decompose` splits what remains into groups that share no
+   constraint. They are independent apart from the board's total mine count, so
+   solving them separately turns a product of their solution counts into a sum.
+3. Each group is enumerated depth-first, recording `ways[k]` — layouts using
+   exactly `k` mines — and `cell_ways[c][k]`.
+4. `components::combine` convolves those, folds in `C(interior, mines_left)` for
+   the cells no number speaks about, and divides out.
 
-**Key constants** (top of `calculate_mine_probabilities`):
+`ConstraintSearch::max_nodes` bounds the search. Past it the strategy reports no
+result and the caller falls back to `MonteCarlo`, which is bounded too and gives
+up once it is clear no valid sample is coming. `ConstraintSearch::exhaustive()`
+removes the bound for offline work.
 
-```rust
-const MAX_VALID: usize = 10_000;
-const MAX_ATTEMPTS: usize = 1_000_000;
-```
+The estimators are fast enough to be called on every move at any board size:
+worst measured single solve is ~12 ms on boards up to 200 a side, against 137
+seconds before decomposition.
 
-Adjust these to trade accuracy for speed.
+**Never treat a probability of 0.0 or 1.0 as merely a small or large number.**
+Every front-end reads 0.0 as proof that a cell is safe and opens it. The solver
+decides those two values from integer layout counts, never from the computed
+ratio, precisely so that a weight underflowing in the tails cannot manufacture a
+proof. A sampled 0% means only that no draw happened to put a mine there.
+
+---
+
+### Neural estimator (`neural` feature)
+
+An optional CNN that predicts one cell's probability from a 9x9 patch, trained on
+exact labels from the solver. Off by default; `cargo build --features neural`.
+See `neural/README.md` for the pipeline and for the four separate reasons it could
+not be trained before.
+
+The patch layout is written down twice — `probability/neural.rs` and
+`neural/dataset.py` — and nothing ties them together. Change one and change the
+other, or the model is served inputs it never saw and returns confident nonsense
+rather than an error. `minesweeper_core/tests/neural.rs` catches the drift.
 
 ---
 
@@ -181,10 +207,20 @@ required); run it after `./wasm/build.sh`.
 
 ### Improving the probability estimator
 
-- The current approach is **constraint-satisfied Monte Carlo**. It becomes less efficient (more attempts per valid sample) as more cells are revealed and constraints tighten.
-- A natural next step is **constraint propagation**: identify cells that are *certainly* mines or *certainly* safe from the numbered constraints alone before running Monte Carlo on the remaining unknowns.
-- Another improvement is **border-only sampling**: only the cells adjacent to at least one visible numbered cell are directly constrained; interior hidden cells can be handled analytically once the border is solved.
-- When adding a smarter strategy, expose it through the same `calculate_mine_probabilities` signature so all front-ends benefit without changes.
+The cheap wins are taken: constraint propagation, border-versus-interior
+separation, independent-region decomposition, and reuse of region solutions
+between moves all landed, and together took the worst case from 137 s to ~12 ms.
+What is left is the case decomposition cannot help — a single region too large to
+enumerate, where the search hits its budget and the answer falls back to sampling.
+
+The next step there is a dynamic program over the search frontier: merge partial
+assignments that agree on the cells still in play and on how many mines they have
+used, instead of walking each one to a leaf. That is polynomial where the border
+is thin, which it usually is. It would subsume decomposition rather than replace
+it, since disconnected regions are just frontiers that never meet.
+
+Whatever the strategy, keep the same two guarantees: bounded work, and no 0.0 or
+1.0 that is not proven.
 
 ### Adding a new front-end
 
