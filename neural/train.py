@@ -1,7 +1,14 @@
 """Training script for PatchCNN.
 
 Usage:
+    cargo build --release -p datagen
+    python neural/datagen.py 200000 8    # generate labelled positions
+    python neural/prepare.py             # convert JSONL to streamable arrays
     python neural/train.py [--epochs 30] [--batch 2048] [--workers 4] [--resume]
+
+The prepare step is not optional: the trainer reads the arrays it writes, not the
+JSONL. See prepare.py for why — reading JSONL meant holding every record in
+memory, which is what kept this from training at all.
 
 Checkpoints saved to neural/checkpoints/best.pt (best val BCE).
 """
@@ -49,6 +56,10 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--limit", type=int, default=0,
+        help="train on at most this many samples per epoch, for a quick check",
+    )
     args = parser.parse_args()
 
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,9 +67,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    train_ds = MinesweeperDataset(DATA_DIR / "train.jsonl", augment=True)
-    val_ds = MinesweeperDataset(DATA_DIR / "val.jsonl", augment=False)
+    train_ds = MinesweeperDataset(DATA_DIR / "train", augment=True)
+    val_ds = MinesweeperDataset(DATA_DIR / "val", augment=False)
     print(f"Train samples: {len(train_ds):,}  Val samples: {len(val_ds):,}")
+
+    if args.limit and args.limit < len(train_ds):
+        train_ds = torch.utils.data.Subset(train_ds, range(args.limit))
+        print(f"Limited to {len(train_ds):,} training samples")
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,

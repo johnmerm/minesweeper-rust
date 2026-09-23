@@ -9,29 +9,27 @@
 /// Run via `python neural/datagen.py N_SAMPLES N_PROCESSES` which
 /// spawns this binary in parallel and merges the output streams.
 ///
-/// Speed contract: CS is only called when hidden_cells ≤ MAX_HIDDEN_FOR_CS,
-/// which keeps each label computation to < ~10 ms.
+/// Every label is exact. Positions the search cannot finish within its budget are
+/// skipped rather than labelled with a sampled estimate — a sampled label looks
+/// exactly like an exact one in the output, so letting one through would quietly
+/// teach the model someone else's guesses.
 
 use std::io::{self, Write};
 
 use rand::Rng;
 use serde::Serialize;
 
-use minesweeper_core::probability::{ConstraintSearch, ProbabilityStrategy};
+use minesweeper_core::probability::{ConstraintSearch, SimUpdate};
 use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
 
 // Board configurations: (width, height, mines)
-// Expert 30×16 excluded — too many hidden cells for CS to label fast.
-const CONFIGS: [(usize, usize, usize); 4] = [
+const CONFIGS: [(usize, usize, usize); 5] = [
     (9, 9, 10),   // beginner
     (10, 10, 15), // custom small
     (16, 16, 40), // intermediate
     (16, 16, 51), // custom intermediate
+    (30, 16, 99), // expert
 ];
-
-/// CS is called only when ≤ this many hidden cells remain.
-/// C(80, 40) ≈ 1e22 but CS is constrained — empirically < 5 ms.
-const MAX_HIDDEN_FOR_CS: usize = 80;
 
 #[derive(Serialize)]
 struct CellRecord {
@@ -57,6 +55,20 @@ fn count_hidden(game: &Minesweeper) -> usize {
         .count()
 }
 
+/// Exact per-cell probabilities, or `None` when the search could not finish.
+fn exact_labels(cs: &ConstraintSearch, game: &Minesweeper) -> Option<Vec<Vec<f64>>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    cs.calculate_with_progress(game, tx);
+    while let Ok(update) = rx.recv() {
+        if let SimUpdate::Done { valid, probs, .. } = update {
+            // Zero layouts is how the search reports that it has no trustworthy
+            // answer, whether from an exhausted budget or an unusable one.
+            return (valid > 0).then_some(probs);
+        }
+    }
+    None
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
@@ -65,7 +77,10 @@ fn main() {
     let mut out = io::BufWriter::new(stdout.lock());
 
     let mut rng = rand::thread_rng();
-    let cs = ConstraintSearch::exhaustive();
+    // Budgeted rather than exhaustive, and kept across positions so its cache of
+    // region solutions carries over. Unbounded would risk one pathological
+    // position stalling a worker for minutes in an unattended run.
+    let cs = ConstraintSearch::new();
     let mut generated = 0;
 
     while generated < n {
@@ -83,13 +98,13 @@ fn main() {
 
         // Simulate a partial game with random moves only (fast).
         // We want diversity in board state, not play quality.
+        //
+        // Every stage of a game is wanted, not just the end: this used to stop as
+        // soon as few enough cells were left for the labeller to keep up, which
+        // meant the model only ever saw endgames.
         let max_moves = rng.gen_range(1..=(w * h / 4).max(2));
         for _ in 0..max_moves {
             if game.state != GameState::Playing {
-                break;
-            }
-            // Stop early once there are few enough hidden cells for CS labeling.
-            if count_hidden(&game) <= MAX_HIDDEN_FOR_CS {
                 break;
             }
 
@@ -109,13 +124,16 @@ fn main() {
             continue;
         }
 
-        let n_hidden = count_hidden(&game);
-        if n_hidden == 0 || n_hidden > MAX_HIDDEN_FOR_CS {
-            continue; // Too many hidden cells — CS would be too slow.
+        if count_hidden(&game) == 0 {
+            continue;
         }
 
-        // Compute exact probability labels (CS is fast here).
-        let probs = cs.calculate(&game);
+        // Exact probability labels, or nothing. `calculate` would fall back to
+        // sampling when the search runs out of budget; going through the channel
+        // lets us see that it did and drop the position instead.
+        let Some(probs) = exact_labels(&cs, &game) else {
+            continue;
+        };
 
         // Build the serializable grid.
         let grid: Vec<Vec<CellRecord>> = (0..h)
