@@ -29,6 +29,23 @@
   var pendingCompute = null;
   var startedAt = 0, timerId = 0;
 
+  // The neural overlay. `neuralState` is one of: 'off', 'loading', 'on',
+  // 'unavailable' — the page works perfectly well without a model, so failing to
+  // find one is a state rather than an error.
+  var neuralState = 'off';
+  var neuralFrame = null;
+  var neuralLeft = 0, neuralTotal = 0;
+  var neuralChunk = 4;        // cells per step call, adapted to the frame budget
+  var neuralError = null;     // mean |network - exact| at the last correction
+  // How much of a frame the network may take. The exact values are already on
+  // screen by then, so this only decides how fast the overlay fills in; anything
+  // much larger and the board stops responding while it does.
+  var FRAME_BUDGET_MS = 8;
+  // `render` walks every cell on the board, which on a 120x120 grid costs more
+  // than the handful of network passes a frame fits. Repainting a few times a
+  // second still reads as filling in, and leaves the frame to the work.
+  var REPAINT_EVERY_MS = 120;
+
   var el = {
     grid: document.getElementById('grid'),
     status: document.getElementById('status'),
@@ -40,7 +57,8 @@
     width: document.getElementById('in-width'),
     height: document.getElementById('in-height'),
     mines: document.getElementById('in-mines'),
-    strategy: document.getElementById('in-strategy')
+    strategy: document.getElementById('in-strategy'),
+    neuralNote: document.getElementById('neural-note')
   };
 
   /* ---------------------------------------------------------------- loading */
@@ -101,6 +119,9 @@
   function stats() {
     return new Uint32Array(wasm.memory.buffer, wasm.ms_stats_ptr(), wasm.ms_stats_len());
   }
+  function neuralProbs() {
+    return new Float32Array(wasm.memory.buffer, wasm.ms_neural_probs_ptr(), width * height);
+  }
 
   /* ------------------------------------------------------------- rendering */
 
@@ -120,6 +141,9 @@
       var label = document.createElement('span');
       label.className = 'prob';
       cell.appendChild(label);
+      var guess = document.createElement('span');
+      guess.className = 'guess';
+      cell.appendChild(guess);
       cellEls[i] = cell;
       frag.appendChild(cell);
     }
@@ -135,6 +159,9 @@
 
   function render() {
     var c = cells(), p = probs();
+    // -1 marks a cell the network has not reached yet, which is why the buffer
+    // cannot simply start at zero: nearly-zero is a real answer here.
+    var g = neuralState === 'on' ? neuralProbs() : null;
     var over = wasm.ms_state() !== 0;
 
     for (var i = 0; i < cellEls.length; i++) {
@@ -157,23 +184,33 @@
       // Touching the DOM for a cell that already looks right is what made a big
       // board crawl: a move changes a handful of cells, but repainting all of
       // them cost seconds on a 120x120 grid — far more than the estimator did.
-      var shown = cls + '\u0000' + bg + '\u0000' + text + '\u0000' + (over ? '' : pct);
+      var guessed = '';
+      if (g && !over && (code === HIDDEN || code === FLAGGED) && g[i] >= 0) {
+        guessed = Math.round(g[i] * 100) + '%';
+      }
+
+      var shown = cls + '\u0000' + bg + '\u0000' + text + '\u0000' + (over ? '' : pct) +
+                  '\u0000' + guessed;
       if (painted[i] === shown) {
         continue;
       }
       painted[i] = shown;
 
-      var node = cellEls[i], label = node.lastChild;
+      var node = cellEls[i], guessLabel = node.lastChild, label = guessLabel.previousSibling;
+      guessLabel.textContent = guessed;
       node.className = cls;
       node.style.backgroundColor = bg;
-      node.title = pct ? 'Mine: ' + pct : '';
-      // firstChild is the text node we manage; the trailing span is the label.
-      if (node.firstChild !== label) node.removeChild(node.firstChild);
+      node.title = pct ? 'Mine: ' + pct + (guessed ? '  network: ' + guessed : '') : '';
+      // firstChild is the text node we manage; the two trailing spans are labels.
+      if (node.firstChild !== label && node.firstChild !== guessLabel) {
+        node.removeChild(node.firstChild);
+      }
       if (text) node.insertBefore(document.createTextNode(text), label);
       label.textContent = over ? '' : pct;
     }
 
     el.grid.classList.toggle('no-prob', !showProbs);
+    el.grid.classList.toggle('neural', neuralState === 'on');
     renderStatus();
   }
 
@@ -227,6 +264,147 @@
     });
   }
 
+  /* --------------------------------------------------------- neural overlay */
+
+  /**
+   * Hand the trained weights to the module.
+   *
+   * `ms_model_buffer` may grow linear memory, so the view onto it is built after
+   * the call and never before — the same rule as every other buffer here.
+   */
+  function loadModel() {
+    var bytes = typeof MINESWEEPER_MODEL_BASE64 === 'string'
+      ? Promise.resolve(base64ToBytes(MINESWEEPER_MODEL_BASE64))
+      : fetch('model.bin' + (buildId() ? '?v=' + buildId() : ''))
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.arrayBuffer();
+          })
+          .then(function (buf) { return new Uint8Array(buf); });
+
+    return bytes.then(function (data) {
+      var ptr = wasm.ms_model_buffer(data.length);
+      new Uint8Array(wasm.memory.buffer, ptr, data.length).set(data);
+      if (!wasm.ms_model_load()) throw new Error('the module rejected the weights');
+    });
+  }
+
+  function cancelNeural() {
+    if (neuralFrame !== null) cancelAnimationFrame(neuralFrame);
+    neuralFrame = null;
+  }
+
+  function neuralNote(text) {
+    el.neuralNote.textContent = text;
+  }
+
+  /**
+   * Score every unopened cell, a few per animation frame.
+   *
+   * One forward pass per cell is not cheap and there are up to 40 000 of them, so
+   * doing it in one go would freeze the page for seconds. Instead each frame
+   * spends a fixed slice of time on it and gives the rest back, and `render`
+   * paints whatever has arrived — cells the pass has not reached yet hold -1 and
+   * simply show nothing. The chunk size is measured rather than guessed, because
+   * a cell costs an order of magnitude more on a phone than on a laptop.
+   */
+  function scheduleNeural() {
+    cancelNeural();
+    if (neuralState !== 'on' || wasm.ms_state() !== 0) return;
+
+    neuralTotal = wasm.ms_neural_begin();
+    neuralLeft = neuralTotal;
+    if (!neuralTotal) {
+      render();
+      neuralNote(describeNeural());
+      return;
+    }
+
+    var painted_at = 0;
+    var tick = function () {
+      neuralFrame = null;
+      var deadline = performance.now() + FRAME_BUDGET_MS;
+      do {
+        var before = performance.now();
+        neuralLeft = wasm.ms_neural_step(neuralChunk);
+        var per = (performance.now() - before) / neuralChunk;
+        if (per > 0) {
+          neuralChunk = Math.max(1, Math.min(512, Math.round(FRAME_BUDGET_MS / per)));
+        }
+      } while (neuralLeft > 0 && performance.now() < deadline);
+
+      var now = performance.now();
+      if (neuralLeft === 0 || now - painted_at > REPAINT_EVERY_MS) {
+        painted_at = now;
+        render();
+        neuralNote(describeNeural());
+      }
+      if (neuralLeft > 0) neuralFrame = requestAnimationFrame(tick);
+    };
+    neuralFrame = requestAnimationFrame(tick);
+  }
+
+  function describeNeural() {
+    if (neuralState === 'loading') return 'network: loading the model…';
+    if (neuralState === 'unavailable') {
+      return 'network: no model available — run neural/export_weights.py and rebuild';
+    }
+    if (neuralState !== 'on') return '';
+    var done = neuralTotal - neuralLeft;
+    var text = neuralLeft > 0
+      ? 'network: ' + done.toLocaleString() + ' / ' + neuralTotal.toLocaleString() + ' cells…'
+      : 'network: ' + neuralTotal.toLocaleString() + ' cells';
+    if (neuralError !== null) {
+      text += ' · off by ' + (neuralError * 100).toFixed(1) + ' points, corrected';
+    }
+    return text;
+  }
+
+  /**
+   * Correct the network from the position just solved.
+   *
+   * Only from an exact solve: the sampled estimator's numbers carry noise, and a
+   * network taught from noise learns the noise. `ms_neural_learn` returns the
+   * mean error before the step, which is the only feedback there is on whether
+   * the thing is any good.
+   */
+  function learnFromExact() {
+    if (neuralState !== 'on' || !wasm.ms_model_ready()) return;
+    if (stats()[STAT_USED] !== MODE_CS) return;
+    var scaled = wasm.ms_neural_learn(20);   // rate 0.02
+    neuralError = scaled ? scaled / 10000 : null;
+  }
+
+  function toggleNeural(btn) {
+    if (neuralState === 'on') {
+      neuralState = 'off';
+      cancelNeural();
+      btn.classList.remove('on');
+      neuralNote('');
+      render();
+      return;
+    }
+    if (neuralState === 'loading') return;
+
+    var start = function () {
+      neuralState = 'on';
+      btn.classList.add('on');
+      scheduleNeural();
+    };
+
+    if (wasm.ms_model_ready()) {
+      start();
+      return;
+    }
+    neuralState = 'loading';
+    neuralNote(describeNeural());
+    loadModel().then(start).catch(function (err) {
+      neuralState = 'unavailable';
+      btn.classList.remove('on');
+      neuralNote(describeNeural() + ' (' + err.message + ')');
+    });
+  }
+
   /* ----------------------------------------------------------- game driving */
 
   /**
@@ -238,13 +416,18 @@
    */
   function scheduleCompute() {
     if (pendingCompute) clearTimeout(pendingCompute);
+    // Whatever the network was scoring describes a board that no longer exists.
+    cancelNeural();
     el.sim.textContent = 'calculating…';
     pendingCompute = setTimeout(function () {
       pendingCompute = null;
       wasm.ms_compute(Number(el.strategy.value));
       if (autoReveal) wasm.ms_auto_reveal(Number(el.strategy.value));
+      learnFromExact();
       render();
       renderSim();
+      // After the exact numbers, never instead of them.
+      scheduleNeural();
     }, 0);
   }
 
@@ -257,6 +440,8 @@
     stopTimer();
     el.timer.textContent = '0:00';
     startedAt = 0;
+    cancelNeural();
+    neuralError = null;
     render();
     // A fresh board still has a probability: mines / cells, the same for every
     // square. Without this the grid would read 0% until the first click.
@@ -314,9 +499,16 @@
       var i = cellIndexFrom(e.target);
       if (i < 0) return;
       var c = cells()[i];
-      el.hover.textContent = (c === HIDDEN || c === FLAGGED)
-        ? 'Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%'
-        : '';
+      if (c !== HIDDEN && c !== FLAGGED) {
+        el.hover.textContent = '';
+        return;
+      }
+      var text = 'Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%';
+      if (neuralState === 'on') {
+        var guess = neuralProbs()[i];
+        text += guess >= 0 ? ' · network: ' + (guess * 100).toFixed(1) + '%' : ' · network: …';
+      }
+      el.hover.textContent = text;
     });
     el.grid.addEventListener('mouseleave', function () { el.hover.textContent = ''; });
 
@@ -349,6 +541,9 @@
       flagMode = !flagMode;
       flagBtn.classList.toggle('on', flagMode);
     });
+
+    var neuralBtn = document.getElementById('btn-neural');
+    neuralBtn.addEventListener('click', function () { toggleNeural(neuralBtn); });
 
     el.strategy.addEventListener('change', scheduleCompute);
   }

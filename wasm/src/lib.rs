@@ -30,7 +30,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 
-use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, NeuralNetwork, SimUpdate};
+use minesweeper_core::probability::{certain_cells, BoardScorer, ConstraintSearch, MonteCarlo, PatchCnn, SimUpdate};
 use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
 
 mod rng;
@@ -79,12 +79,14 @@ const MAX_DIM: usize = 200;
 
 struct AppState {
     game: Minesweeper,
-    /// The neural estimator, once JavaScript has handed over a model.
-    network: Option<NeuralNetwork>,
-    /// Scratch space JavaScript writes the ONNX bytes into.
+    /// The neural estimator, once JavaScript has handed over its weights.
+    network: Option<PatchCnn>,
+    /// Scratch space JavaScript writes the weights into.
     incoming: Vec<u8>,
     /// The network's guess per cell, alongside `probs` from the exact search.
     neural_probs: Vec<f32>,
+    /// The scoring pass in flight, if any.
+    scoring: Option<BoardScorer>,
     cells: Vec<u8>,
     probs: Vec<f32>,
     stats: [u32; STAT_LEN],
@@ -105,6 +107,7 @@ impl AppState {
             network: None,
             incoming: Vec::new(),
             neural_probs: vec![0.0; width * height],
+            scoring: None,
         };
         state.sync_cells();
         state
@@ -427,7 +430,7 @@ pub extern "C" fn ms_stats_len() -> u32 {
     STAT_LEN as u32
 }
 
-/// Reserve `len` bytes for an ONNX model and return where to write them.
+/// Reserve `len` bytes for the network's weights and return where to write them.
 #[no_mangle]
 pub extern "C" fn ms_model_buffer(len: u32) -> *mut u8 {
     with_state(|state| {
@@ -442,7 +445,7 @@ pub extern "C" fn ms_model_buffer(len: u32) -> *mut u8 {
 pub extern "C" fn ms_model_load() -> u32 {
     with_state(|state| {
         let bytes = std::mem::take(&mut state.incoming);
-        match NeuralNetwork::from_bytes(&bytes) {
+        match PatchCnn::from_bytes(&bytes) {
             Ok(network) => {
                 state.network = Some(network);
                 1
@@ -452,33 +455,80 @@ pub extern "C" fn ms_model_load() -> u32 {
     })
 }
 
+/// Whether a network has been loaded.
+#[no_mangle]
+pub extern "C" fn ms_model_ready() -> u32 {
+    with_state(|state| state.network.is_some() as u32)
+}
+
 /// Pointer to `width * height` f32 network predictions. Re-read after every call.
 #[no_mangle]
 pub extern "C" fn ms_neural_probs_ptr() -> *const f32 {
     with_state(|state| state.neural_probs.as_ptr())
 }
 
-/// Run the network over the board. Returns 1 if it ran, 0 if no model is loaded.
+/// Start scoring the board. Returns the number of cells that will be scored.
+///
+/// Any pass already running is abandoned: it was measuring a board that no longer
+/// exists, and half of one position beside half of another is not a reading of
+/// anything.
 #[no_mangle]
-pub extern "C" fn ms_neural_compute() -> u32 {
+pub extern "C" fn ms_neural_begin() -> u32 {
     with_state(|state| {
-        let Some(network) = &state.network else { return 0 };
-        let (tx, rx) = std::sync::mpsc::channel();
-        network.calculate_with_progress(&state.game, tx);
-        let mut probs = Vec::new();
-        while let Ok(update) = rx.recv() {
-            if let SimUpdate::Done { probs: p, .. } = update {
-                probs = p;
-                break;
-            }
-        }
+        let Some(network) = &state.network else {
+            state.scoring = None;
+            return 0;
+        };
         state.neural_probs.clear();
-        for y in 0..state.game.height {
-            for x in 0..state.game.width {
-                let p = probs.get(y).and_then(|row| row.get(x)).copied().unwrap_or(0.0);
-                state.neural_probs.push(p as f32);
-            }
+        state.neural_probs.resize(state.game.width * state.game.height, -1.0);
+        let scorer = network.scorer(&state.game);
+        let total = scorer.remaining() as u32;
+        state.scoring = Some(scorer);
+        total
+    })
+}
+
+/// Score up to `budget` more cells. Returns how many cells are still to do.
+///
+/// The caller decides the budget — enough to make progress, few enough to give
+/// the frame back. Cells not yet scored read -1 in the buffer, so the display can
+/// tell "not known yet" from "nearly zero".
+#[no_mangle]
+pub extern "C" fn ms_neural_step(budget: u32) -> u32 {
+    with_state(|state| {
+        let (Some(network), Some(scorer)) = (&state.network, &mut state.scoring) else {
+            return 0;
+        };
+        scorer.step(network, budget as usize, &mut state.neural_probs);
+        let left = scorer.remaining() as u32;
+        if left == 0 {
+            state.scoring = None;
         }
-        1
+        left
+    })
+}
+
+/// Teach the network from the exact probabilities currently in `ms_probs_ptr`.
+///
+/// Every position the solver scores is a perfectly labelled example that cost
+/// nothing extra to produce, so the network can be corrected as the game goes on.
+/// Only the output layer moves — see `PatchCnn::learn`. Returns the mean error
+/// before the step, scaled by 10000 so it can come back as an integer.
+#[no_mangle]
+pub extern "C" fn ms_neural_learn(rate_millis: u32) -> u32 {
+    with_state(|state| {
+        let Some(network) = &mut state.network else { return 0 };
+        if !state.game.mines_generated {
+            return 0;
+        }
+        let width = state.game.width;
+        let exact: Vec<Vec<f64>> = (0..state.game.height)
+            .map(|y| (0..width).map(|x| state.probs[y * width + x] as f64).collect())
+            .collect();
+        let rate = rate_millis as f32 / 1000.0;
+        match network.learn_from_board(&state.game, &exact, rate) {
+            Some(error) => (error * 10_000.0) as u32,
+            None => 0,
+        }
     })
 }

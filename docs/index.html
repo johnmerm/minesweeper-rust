@@ -62,7 +62,16 @@
     font-size: 8px; font-weight: 600; color: #444;
     pointer-events: none; letter-spacing: -0.3px;
   }
-  .grid.no-prob .prob { display: none; }
+  /* The network's guess, kept visually subordinate to the exact value: it is an
+     approximation of the number in the other corner, not a second opinion of
+     equal standing. */
+  .guess {
+    position: absolute; top: 0; left: 2px;
+    font-size: 8px; font-weight: 600; color: #6a4fb6;
+    pointer-events: none; letter-spacing: -0.3px;
+  }
+  .grid.no-prob .prob, .grid:not(.neural) .guess { display: none; }
+  .neural-note { margin-top: 2px; font-size: 11px; color: #6a4fb6; min-height: 1.3em; }
 
   #hover { margin-top: 10px; font-size: 14px; color: #555; min-height: 1.4em; }
   .sim { margin-top: 2px; font-size: 11px; line-height: 1.6; text-align: center; color: #888; }
@@ -108,6 +117,7 @@
 
 <div id="hover"></div>
 <div class="sim" id="sim"></div>
+<div class="neural-note" id="neural-note"></div>
 
 <div class="panel">
   <label>W <input type="number" id="in-width"  value="10" min="3" max="200"></label>
@@ -130,19 +140,21 @@
   <button id="btn-probs" class="on">Show probabilities</button>
   <button id="btn-auto">Auto-play deductions</button>
   <button id="btn-flagmode">Flag mode</button>
+  <button id="btn-neural">Neural overlay</button>
 </div>
 
 <p class="hint">
   Left click reveals &middot; right click (or <em>flag mode</em>) flags.<br>
   Cells are tinted from grey to red by the estimated chance they hide a mine.<br>
-  <em>Auto-play deductions</em> opens every cell proven safe and flags every cell proven to be a mine.
+  <em>Auto-play deductions</em> opens every cell proven safe and flags every cell proven to be a mine.<br>
+  <em>Neural overlay</em> adds the network's guess in the top-left of each cell, in purple, beside the exact value.
 </p>
 
 <p class="build" id="build"></p>
 
 <!-- Both lines are rewritten by wasm/bundle.py with a hash of the built files, so
      a cached copy of an old script can never be paired with a new page. -->
-<script>var MINESWEEPER_BUILD = "299ef175";</script>
-<script src="minesweeper.js?v=299ef175"></script>
+<script>var MINESWEEPER_BUILD = "3ffdb011";</script>
+<script src="minesweeper.js?v=3ffdb011"></script>
 </body>
 </html>

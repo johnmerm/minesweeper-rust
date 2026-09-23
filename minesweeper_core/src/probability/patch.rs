@@ -142,7 +142,7 @@ impl PatchSource {
     }
 }
 
-fn neighbours(
+pub(super) fn neighbours(
     x: usize,
     y: usize,
     width: usize,

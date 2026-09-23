@@ -165,6 +165,16 @@ and no bundler** so the result can be served as static files from any host
   the diff — never replace it with a timestamp or a commit hash.
 - `MAX_DIM` caps boards at 200 a side. That is a guard on DOM size, not an engine
   limit.
+- The neural overlay is the same architecture as `neural/`, written out by hand in
+  `probability::patch_cnn` — `tract` costs 13 MB in wasm, against 30 KB for the
+  forward pass. `ms_model_buffer`/`ms_model_load` take `docs/model.bin`, then
+  `ms_neural_begin` and `ms_neural_step(budget)` score the board a few cells at a
+  time so the page keeps its frames; `BoardScorer` puts the cells next to a number
+  first. Unscored cells read `-1`, not 0 — nearly-zero is a real answer here.
+  `ms_neural_learn` corrects the output layer from `ms_probs_ptr`, and
+  `minesweeper.js` calls it only after an *exact* solve: a sampled estimate is
+  noise, and the network would learn the noise. The guess never feeds
+  `ms_auto_reveal`, which acts on proof alone.
 
 ---
 

@@ -19,7 +19,7 @@
 //! nothing else. `neural/patchcnn_reference.py` is the same thing in numpy and is
 //! what this is tested against.
 
-use super::patch::{PatchSource, N_CHANNELS, PATCH, PATCH_LEN};
+use super::patch::{neighbours, PatchSource, N_CHANNELS, PATCH, PATCH_LEN};
 use crate::{CellState, Minesweeper};
 
 /// Identifies the weight layout. Any change to the architecture changes this.
@@ -210,22 +210,55 @@ impl PatchCnn {
     }
 
     /// P(mine) for every unopened cell, as a grid. Opened cells read 0.
+    ///
+    /// Scores the whole board in one go, which on anything larger than a small
+    /// board takes long enough to be felt — see [`PatchCnn::scorer`] for the
+    /// interruptible version.
     pub fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>> {
-        let source = PatchSource::new(game);
-        let mut probs = vec![vec![0.0f64; game.width]; game.height];
-        let mut patch = vec![0.0f32; PATCH_LEN];
+        let mut scorer = self.scorer(game);
+        let mut out = vec![0.0f32; game.width * game.height];
+        while scorer.step(self, usize::MAX, &mut out) > 0 {}
 
-        for y in 0..game.height {
-            for x in 0..game.width {
-                if game.grid[y][x].state == CellState::Visible {
-                    continue;
-                }
-                patch.iter_mut().for_each(|v| *v = 0.0);
-                source.fill(x, y, &mut patch);
-                probs[y][x] = self.predict(&patch) as f64;
-            }
+        (0..game.height)
+            .map(|y| (0..game.width).map(|x| out[y * game.width + x] as f64).collect())
+            .collect()
+    }
+
+    /// Begin scoring a board a few cells at a time.
+    ///
+    /// The network costs about six million multiply-adds per cell, and every cell
+    /// needs its own pass — the patch differs by which square is marked as the
+    /// centre — so a whole board is half a second of work at 16x16 and several at
+    /// 50x50. That is fine to spend, but not in one go on a thread that is also
+    /// meant to be drawing: the caller takes a few cells per frame and the numbers
+    /// fill in while the board stays responsive.
+    pub fn scorer(&self, game: &Minesweeper) -> BoardScorer {
+        let unopened = || {
+            (0..game.height)
+                .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| game.grid[y][x].state != CellState::Visible)
+        };
+
+        // Border cells first. A caller scoring a few at a time shows its work as
+        // it goes, and the cells a player is actually deciding between are the
+        // ones a number speaks about — so those are worth the first frames.
+        // Everything deep in unopened territory looks alike to the network and
+        // can arrive whenever.
+        let touches_a_number = |x: usize, y: usize| {
+            neighbours(x, y, game.width, game.height)
+                .any(|(nx, ny)| game.grid[ny][nx].state == CellState::Visible)
+        };
+        let mut cells: Vec<(usize, usize)> =
+            unopened().filter(|&(x, y)| touches_a_number(x, y)).collect();
+        cells.extend(unopened().filter(|&(x, y)| !touches_a_number(x, y)));
+
+        BoardScorer {
+            source: PatchSource::new(game),
+            width: game.width,
+            cells,
+            next: 0,
+            patch: vec![0.0f32; PATCH_LEN],
         }
-        probs
     }
 
     /// Learn from a board the exact solver has already scored.
@@ -331,4 +364,41 @@ fn linear(input: &[f32], layer: &Layer) -> Vec<f32> {
 fn relu(mut values: Vec<f32>) -> Vec<f32> {
     values.iter_mut().for_each(|v| *v = v.max(0.0));
     values
+}
+
+
+/// One board's worth of scoring, handed out in instalments.
+///
+/// Holds its own view of the board taken when it was created, so a board that
+/// changes mid-pass does not produce a grid that is half one position and half
+/// another — the caller throws the scorer away and starts again.
+pub struct BoardScorer {
+    source: PatchSource,
+    width: usize,
+    cells: Vec<(usize, usize)>,
+    next: usize,
+    patch: Vec<f32>,
+}
+
+impl BoardScorer {
+    /// Cells not yet scored.
+    pub fn remaining(&self) -> usize {
+        self.cells.len() - self.next
+    }
+
+    /// Score up to `budget` more cells into `out`, indexed `y * width + x`.
+    ///
+    /// Returns how many were scored this time; zero means the board is finished.
+    pub fn step(&mut self, network: &PatchCnn, budget: usize, out: &mut [f32]) -> usize {
+        let end = self.cells.len().min(self.next.saturating_add(budget));
+        let scored = end - self.next;
+
+        for &(x, y) in &self.cells[self.next..end] {
+            self.patch.iter_mut().for_each(|v| *v = 0.0);
+            self.source.fill(x, y, &mut self.patch);
+            out[y * self.width + x] = network.predict(&self.patch);
+        }
+        self.next = end;
+        scored
+    }
 }

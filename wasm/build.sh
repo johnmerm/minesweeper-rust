@@ -18,6 +18,16 @@ RUSTFLAGS="${RUSTFLAGS:-} -C strip=symbols" \
 
 cp "$artifact" "$out/minesweeper.wasm"
 
+# The trained weights, if they have been exported. The page works without them —
+# the neural overlay simply reports that no model is available — so a missing
+# export is not a build failure.
+weights="$root/neural/onnx/model.bin"
+if [ -f "$weights" ]; then
+  cp "$weights" "$out/model.bin"
+else
+  printf 'no %s — the neural overlay will be unavailable\n' "$weights" >&2
+fi
+
 # standalone.html inlines the module as base64 so the page also runs straight
 # from a file:// URL, where fetching the .wasm would be blocked.
 python3 "$root/wasm/bundle.py" "$out"

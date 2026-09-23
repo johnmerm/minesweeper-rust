@@ -8,7 +8,7 @@ pub mod constraint_search;
 #[cfg(feature = "neural")] pub mod neural;
 pub use monte_carlo::MonteCarlo;
 pub use constraint_search::ConstraintSearch;
-pub use patch_cnn::{PatchCnn, WeightsError};
+pub use patch_cnn::{BoardScorer, PatchCnn, WeightsError};
 #[cfg(feature = "neural")] pub use neural::NeuralNetwork;
 
 pub trait ProbabilityStrategy {

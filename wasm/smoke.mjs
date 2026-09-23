@@ -32,6 +32,7 @@ async function load(seedHi, seedLo) {
     cells: () => new Uint8Array(e.memory.buffer, e.ms_cells_ptr(), e.ms_width() * e.ms_height()),
     probs: () => new Float32Array(e.memory.buffer, e.ms_probs_ptr(), e.ms_width() * e.ms_height()),
     stats: () => new Uint32Array(e.memory.buffer, e.ms_stats_ptr(), e.ms_stats_len()),
+    neural: () => new Float32Array(e.memory.buffer, e.ms_neural_probs_ptr(), e.ms_width() * e.ms_height()),
   };
 }
 
@@ -200,6 +201,84 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
   let sum = 0;
   for (let i = 0; i < 2500; i++) if (cells[i] === HIDDEN || cells[i] === FLAGGED) sum += probs[i];
   check('a large sparse board stays calibrated', Math.abs(sum - 150) < 0.5, `sum ${sum.toFixed(2)} vs 150`);
+}
+
+// The neural overlay: the page loads the weights itself, drives the scoring a
+// few cells per frame, and shows -1 as "not reached yet". All of that is ABI the
+// page depends on and nothing else exercises.
+{
+  const s = await load(7, 11);
+  const weights = path.join(root, 'docs', 'model.bin');
+  if (!fs.existsSync(weights)) {
+    console.log('skip the neural overlay — no docs/model.bin');
+  } else {
+    s.e.ms_new(16, 16, 40);
+    check('no model until one is loaded', s.e.ms_model_ready() === 0);
+    check('scoring without a model does nothing', s.e.ms_neural_begin() === 0);
+
+    // `ms_model_buffer` can grow linear memory, which detaches every existing
+    // view onto it — so the pointer comes back first and the view is built after.
+    const writeModel = (data) => {
+      const ptr = s.e.ms_model_buffer(data.length);
+      new Uint8Array(s.e.memory.buffer, ptr, data.length).set(data);
+    };
+
+    // Nonsense must be refused rather than read as weights.
+    writeModel(new Uint8Array(64));
+    check('a file that is not a model is refused', s.e.ms_model_load() === 0);
+
+    writeModel(new Uint8Array(fs.readFileSync(weights)));
+    check('the trained weights load', s.e.ms_model_load() === 1 && s.e.ms_model_ready() === 1);
+
+    s.e.ms_reveal(8, 8);
+    s.e.ms_compute(0);
+    const total = s.e.ms_neural_begin();
+    const hidden = [...s.cells()].filter((c) => c === HIDDEN || c === FLAGGED).length;
+    check('every unopened cell is scheduled', total === hidden, `${total} vs ${hidden}`);
+    check('nothing is scored before the first step',
+          [...s.neural()].every((v) => v === -1));
+
+    // Drive it the way the page does: a bounded number of cells at a time.
+    let left = total, steps = 0;
+    const t0 = Date.now();
+    while (left > 0 && steps < 10000) { left = s.e.ms_neural_step(32); steps++; }
+    check('stepping finishes the board', left === 0, `${steps} steps, ${Date.now() - t0}ms`);
+
+    const guess = s.neural(), cells = s.cells();
+    let scored = 0, bad = 0;
+    for (let i = 0; i < 256; i++) {
+      if (cells[i] === HIDDEN || cells[i] === FLAGGED) {
+        scored++;
+        if (!(guess[i] >= 0 && guess[i] <= 1)) bad++;
+      } else if (guess[i] !== -1) {
+        bad++;   // an open cell must never be given a guess
+      }
+    }
+    check('every guess is a probability', bad === 0 && scored === total, `${scored} scored, ${bad} bad`);
+
+    // A network that has learned nothing answers the same everywhere, which is
+    // also exactly what a patch layout mismatch looks like.
+    const values = [...guess].filter((v) => v >= 0);
+    const spread = Math.max(...values) - Math.min(...values);
+    check('the network distinguishes cells', spread > 0.01, `spread ${spread.toFixed(3)}`);
+
+    // Correcting from the exact solve must move it towards those numbers.
+    const probs = s.probs();
+    const errorOf = (g) => {
+      let sum = 0, n = 0;
+      for (let i = 0; i < 256; i++) {
+        if (cells[i] === HIDDEN || cells[i] === FLAGGED) { sum += Math.abs(g[i] - probs[i]); n++; }
+      }
+      return sum / n;
+    };
+    const before = errorOf(guess);
+    for (let i = 0; i < 25; i++) s.e.ms_neural_learn(100);
+    s.e.ms_neural_begin();
+    while (s.e.ms_neural_step(64) > 0) { /* score the same board again */ }
+    const after = errorOf(s.neural());
+    check('learning moves the network towards the exact answer', after < before,
+          `${before.toFixed(4)} → ${after.toFixed(4)}`);
+  }
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
