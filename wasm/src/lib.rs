@@ -20,7 +20,7 @@
 //! | `ms_auto_reveal(mode)` | Reveal every provably-safe cell, repeatedly |
 //! | `ms_cells_ptr()` | `u8[width * height]` — see [`encode_cell`] |
 //! | `ms_probs_ptr()` | `f32[width * height]` — mine probability per cell |
-//! | `ms_stats_ptr()` | `u32[7]` — see the `STAT_*` constants |
+//! | `ms_stats_ptr()` | `u32[9]` — see the `STAT_*` constants |
 //! | `ms_width()` / `ms_height()` / `ms_mines()` / `ms_state()` | Scalars |
 //!
 //! Buffers are reallocated by `ms_new`, and the module's linear memory can be
@@ -55,7 +55,11 @@ const STAT_CS_MEMORY: usize = 5;
 /// Which strategy's numbers ended up in the probability buffer: one of `mode::*`
 /// (never `AUTO` — it is resolved to the strategy actually used).
 const STAT_USED: usize = 6;
-const STAT_LEN: usize = 7;
+/// Component solves served from the cache since the page loaded, and solves that
+/// had to be done. Cumulative, not per move.
+const STAT_CACHE_HITS: usize = 7;
+const STAT_CACHE_MISSES: usize = 8;
+const STAT_LEN: usize = 9;
 
 /// Cell encodings written into the buffer returned by [`ms_cells_ptr`].
 mod cell_code {
@@ -78,6 +82,10 @@ struct AppState {
     cells: Vec<u8>,
     probs: Vec<f32>,
     stats: [u32; STAT_LEN],
+    /// Kept across moves, not rebuilt per call: its component cache is what makes
+    /// a second look at the same board nearly free, and a fresh instance would
+    /// start empty every time.
+    exact: ConstraintSearch,
 }
 
 impl AppState {
@@ -87,6 +95,7 @@ impl AppState {
             cells: vec![cell_code::HIDDEN; width * height],
             probs: vec![0.0; width * height],
             stats: [0; STAT_LEN],
+            exact: ConstraintSearch::new(),
         };
         state.sync_cells();
         state
@@ -109,7 +118,7 @@ impl AppState {
         // pay for sampling when the search comes back with no valid layout
         // (which happens on a fresh board, where there are no constraints yet).
         let cs = (mode != mode::MONTE_CARLO)
-            .then(|| run_sync(|tx| ConstraintSearch::new().calculate_with_progress(&self.game, tx)));
+            .then(|| run_sync(|tx| self.exact.calculate_with_progress(&self.game, tx)));
         let cs_ok = cs.as_ref().map_or(false, |run| run.valid > 0);
         let mc = (mode == mode::MONTE_CARLO || (mode == mode::AUTO && !cs_ok))
             .then(|| run_sync(|tx| MonteCarlo::new().calculate_with_progress(&self.game, tx)));
@@ -132,6 +141,9 @@ impl AppState {
             (None, None) => (Vec::new(), mode::AUTO),
         };
         self.stats[STAT_USED] = used;
+        let (hits, misses) = self.exact.cache_counts();
+        self.stats[STAT_CACHE_HITS] = hits;
+        self.stats[STAT_CACHE_MISSES] = misses;
         self.store_probs(&probs);
     }
 

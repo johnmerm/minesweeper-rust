@@ -17,7 +17,8 @@
   var VISIBLE_MINE = 9, HIDDEN = 10, FLAGGED = 11;
   // Indices into the u32 stats array, mirroring the STAT_* constants.
   var STAT_MC_VALID = 0, STAT_MC_ATTEMPTS = 1, STAT_MC_MEMORY = 2,
-      STAT_CS_VALID = 3, STAT_CS_ATTEMPTS = 4, STAT_CS_MEMORY = 5, STAT_USED = 6;
+      STAT_CS_VALID = 3, STAT_CS_ATTEMPTS = 4, STAT_CS_MEMORY = 5, STAT_USED = 6,
+      STAT_CACHE_HITS = 7, STAT_CACHE_MISSES = 8;
   var MODE_AUTO = 0, MODE_MC = 1, MODE_CS = 2;
 
   var wasm = null;          // the module's exports
@@ -190,6 +191,13 @@
     return (b / 1048576).toFixed(1) + ' MB';
   }
 
+  /** Share of region solves answered from the cache, since the page loaded. */
+  function reuse(s) {
+    var looked = s[STAT_CACHE_HITS] + s[STAT_CACHE_MISSES];
+    if (!looked) return '';
+    return ' · ' + Math.round(100 * s[STAT_CACHE_HITS] / looked) + '% reused';
+  }
+
   function renderSim() {
     var s = stats();
     var lines = [];
@@ -199,7 +207,8 @@
         // "layouts" is the sum over independent regions, not the product: the
         // solver splits the board and never enumerates the whole cross-product.
         text: 'exact: ' + s[STAT_CS_VALID].toLocaleString() + ' region layouts / ' +
-              s[STAT_CS_ATTEMPTS].toLocaleString() + ' nodes [' + formatBytes(s[STAT_CS_MEMORY]) + ']'
+              s[STAT_CS_ATTEMPTS].toLocaleString() + ' nodes [' + formatBytes(s[STAT_CS_MEMORY]) + ']' +
+              reuse(s)
       });
     }
     if (s[STAT_MC_ATTEMPTS] > 0 || s[STAT_MC_VALID] > 0) {

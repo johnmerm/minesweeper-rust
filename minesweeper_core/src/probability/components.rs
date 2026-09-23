@@ -40,6 +40,7 @@
 //! fall out.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::monte_carlo::SimSetup;
 
@@ -59,6 +60,128 @@ pub(crate) struct ComponentSolution {
     pub(crate) ways: Vec<f64>,
     /// `cell_ways[c][k]` — layouts using `k` mines in which local cell `c` is one.
     pub(crate) cell_ways: Vec<Vec<f64>>,
+}
+
+impl ComponentSolution {
+    /// Rough heap cost, for the cache's size accounting.
+    fn weight(&self) -> usize {
+        self.ways.len() * 8 + self.cell_ways.iter().map(|row| row.len() * 8 + 24).sum::<usize>()
+    }
+}
+
+/// What a component is, independently of the board it came from: which squares
+/// it covers and what the numbers say about them.
+///
+/// Two components with the same signature have the same solution — not merely a
+/// similar one — because [`ComponentSolution`] is a function of exactly these
+/// inputs and nothing else. That is what lets solutions be reused across moves,
+/// and why the cache needs no invalidation: an entry cannot go stale, since a
+/// board that changes a component changes its signature too.
+///
+/// Board coordinates, deliberately. Hidden-cell indices are renumbered by
+/// `SimSetup::build` on every move as cells are opened and proved, so a key built
+/// from them would miss every time — or worse, collide between different squares.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct Signature {
+    /// The component's squares, in its own local order.
+    cells: Vec<(u16, u16)>,
+    /// Constraints as (local cell indices, mines required), sorted so that the
+    /// same set of numbers always produces the same key.
+    constraints: Vec<(Vec<u16>, u16)>,
+}
+
+impl Signature {
+    /// Rough heap cost of keeping this key, for the cache's size accounting.
+    fn weight(&self) -> usize {
+        self.cells.len() * 4
+            + self
+                .constraints
+                .iter()
+                .map(|(cells, _)| cells.len() * 2 + 8)
+                .sum::<usize>()
+    }
+}
+
+/// Describe a component in board terms.
+///
+/// `component.cells` is ascending in hidden-cell index, and `SimSetup::build`
+/// numbers hidden cells in row-major order, so the local indices are already
+/// canonical: the same squares always produce the same local numbering.
+pub(crate) fn signature(component: &Component, hidden_cells: &[(usize, usize)]) -> Signature {
+    let cells = component
+        .cells
+        .iter()
+        .map(|&i| {
+            let (x, y) = hidden_cells[i];
+            (x as u16, y as u16)
+        })
+        .collect();
+
+    let mut constraints: Vec<(Vec<u16>, u16)> = component
+        .constraints
+        .iter()
+        .map(|(cells, required)| {
+            let mut cells: Vec<u16> = cells.iter().map(|&c| c as u16).collect();
+            cells.sort_unstable();
+            (cells, *required as u16)
+        })
+        .collect();
+    constraints.sort();
+
+    Signature { cells, constraints }
+}
+
+/// Component solutions kept from one move to the next.
+///
+/// Opening a square changes the numbers around it and nothing else, so most of
+/// the board's components come back identical and their answers can be reused.
+/// Entries never need invalidating — see [`Signature`] — so the only reason to
+/// drop one is to bound memory.
+#[derive(Default)]
+pub struct SolutionCache {
+    entries: HashMap<Signature, Rc<ComponentSolution>>,
+    /// Rough heap bytes held, so a long game cannot grow this without limit.
+    bytes: usize,
+    hits: u32,
+    misses: u32,
+}
+
+impl SolutionCache {
+    /// Roughly 8 MB of solutions. Past this the cache is emptied rather than
+    /// evicted one by one: entries stop being useful once the board has moved on,
+    /// so tracking recency would cost more than it saves.
+    const MAX_BYTES: usize = 8 << 20;
+
+    pub(crate) fn get(&mut self, signature: &Signature) -> Option<Rc<ComponentSolution>> {
+        match self.entries.get(signature) {
+            Some(solution) => {
+                self.hits += 1;
+                Some(Rc::clone(solution))
+            }
+            None => {
+                self.misses += 1;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn insert(&mut self, signature: Signature, solution: Rc<ComponentSolution>) {
+        let cost = signature.weight() + solution.weight();
+        if self.bytes + cost > Self::MAX_BYTES {
+            self.entries.clear();
+            self.bytes = 0;
+        }
+        if self.entries.insert(signature, solution).is_none() {
+            self.bytes += cost;
+        }
+    }
+
+    /// How many component solves have been served from the cache, and how many
+    /// had to be computed. Reported by the front-ends; also how the tests check
+    /// that reuse is actually happening.
+    pub fn counts(&self) -> (u32, u32) {
+        (self.hits, self.misses)
+    }
 }
 
 /// Partition the constrained cells into connected components.
@@ -146,7 +269,7 @@ fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
 pub(crate) fn combine(
     setup: &SimSetup,
     components: &[Component],
-    solutions: &[ComponentSolution],
+    solutions: &[Rc<ComponentSolution>],
     interior: &[usize],
 ) -> Option<Vec<f64>> {
     let mines_total = setup.mines_to_place;

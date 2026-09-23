@@ -515,3 +515,37 @@ fn the_unbounded_search_agrees_with_the_budgeted_one() {
         }
     }
 }
+
+/// A cached component solution must be indistinguishable from a freshly computed
+/// one. The cache is keyed on the component's signature and never invalidated, so
+/// this is the test that the key really does determine the answer — if two
+/// different components could share a key, this is where it would show.
+#[test]
+fn a_warm_cache_changes_no_answer() {
+    for seed in 0..8u64 {
+        for (width, height, mines) in [(16, 16, 40), (30, 16, 99), (20, 20, 70)] {
+            // One solver kept across the whole game, accumulating cached solutions.
+            let warm = ConstraintSearch::new();
+            sweep(seed * 23 + 4, width, height, mines, |game| {
+                let cached = warm.calculate(game);
+                // A solver that has never seen anything, for the same position.
+                let fresh = ConstraintSearch::new().calculate(game);
+                for y in 0..game.height {
+                    for x in 0..game.width {
+                        assert_eq!(
+                            cached[y][x], fresh[y][x],
+                            "{width}x{height}/{mines} seed {seed}: ({x}, {y}) differs \
+                             between a warm and a cold cache"
+                        );
+                    }
+                }
+            });
+            let (hits, misses) = warm.cache_counts();
+            assert!(
+                hits > 0,
+                "{width}x{height}/{mines} seed {seed}: nothing was reused \
+                 ({hits} hits, {misses} misses) — the cache is not working"
+            );
+        }
+    }
+}

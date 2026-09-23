@@ -1,10 +1,12 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::mpsc::Sender;
 
 use crate::Minesweeper;
 
 use super::{ProbabilityStrategy, SimUpdate, Strategy};
-use super::components::{combine, decompose, ComponentSolution};
+use super::components::{combine, decompose, signature, ComponentSolution, SolutionCache};
 use super::monte_carlo::{build_probs, mc_memory_estimate, SimSetup};
 use super::MonteCarlo;
 
@@ -62,6 +64,13 @@ pub struct ConstraintSearch {
     /// Set it to `usize::MAX` for an unbounded, always-exact search when latency
     /// does not matter (offline analysis, training-data generation).
     pub max_nodes: usize,
+    /// Component solutions kept between boards.
+    ///
+    /// Reuse depends entirely on how long this instance lives: a caller that
+    /// builds a `ConstraintSearch` per move gets the previous behaviour with an
+    /// empty map, and one that keeps it across moves gets the cache. That is the
+    /// whole opt-in — there is no flag.
+    cache: RefCell<SolutionCache>,
 }
 
 /// Node budget that keeps a single solve inside a comfortable interactive
@@ -73,6 +82,7 @@ impl ConstraintSearch {
     pub fn new() -> Self {
         Self {
             max_nodes: DEFAULT_MAX_NODES,
+            cache: RefCell::default(),
         }
     }
 
@@ -80,7 +90,15 @@ impl ConstraintSearch {
     pub fn exhaustive() -> Self {
         Self {
             max_nodes: usize::MAX,
+            cache: RefCell::default(),
         }
+    }
+
+    /// Component solves served from the cache, and solves that had to be done.
+    ///
+    /// Both are zero for an instance that is not kept between moves.
+    pub fn cache_counts(&self) -> (u32, u32) {
+        self.cache.borrow().counts()
     }
 
     /// Solve the board and report the result through `tx`.
@@ -149,16 +167,24 @@ impl ConstraintSearch {
         // that runs out makes the entire answer untrustworthy: its own numbers are
         // biased, and they feed every other cell through the combination.
         let mut remaining = self.max_nodes;
-        let mut solutions = Vec::with_capacity(components.len());
+        let mut solutions: Vec<Rc<ComponentSolution>> = Vec::with_capacity(components.len());
         let mut layouts = 0usize;
         let mut nodes = 0usize;
 
         for component in &components {
+            // Most of the board is untouched by any one move, so most components
+            // come back exactly as they were and their answers can be reused.
+            let key = signature(component, &setup.hidden_cells);
+            if let Some(solution) = self.cache.borrow_mut().get(&key) {
+                solutions.push(solution);
+                continue;
+            }
+
             // Bounded by the component's own size and nothing else. Capping it at
             // the board's remaining mines would be free today, but it would make
             // the result depend on the rest of the board — and its independence is
             // the whole reason components can be solved separately, and the reason
-            // one could be cached across moves. Layouts that use more mines than
+            // one can be cached across moves at all. Layouts using more mines than
             // the board has left are discarded in the combination, where the rest
             // of the board is actually known.
             let mut dfs = Dfs::new(
@@ -174,10 +200,13 @@ impl ConstraintSearch {
             remaining = remaining.saturating_sub(dfs.nodes);
             nodes += dfs.nodes;
             layouts += dfs.valid_count as usize;
-            solutions.push(ComponentSolution {
+
+            let solution = Rc::new(ComponentSolution {
                 ways: dfs.ways,
                 cell_ways: dfs.cell_ways,
             });
+            self.cache.borrow_mut().insert(key, Rc::clone(&solution));
+            solutions.push(solution);
         }
 
         let probabilities = combine(setup, &components, &solutions, &interior)?;
