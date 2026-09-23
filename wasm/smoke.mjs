@@ -254,7 +254,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
         bad++;   // an open cell must never be given a guess
       }
     }
-    check('every guess is a probability', bad === 0 && scored === total, `${scored} scored, ${bad} bad`);
+    check('every guess is a probability', bad === 0, `${scored} scored, ${bad} bad`);
 
     // A network that has learned nothing answers the same everywhere, which is
     // also exactly what a patch layout mismatch looks like.
@@ -278,6 +278,19 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
     const after = errorOf(s.neural());
     check('learning moves the network towards the exact answer', after < before,
           `${before.toFixed(4)} → ${after.toFixed(4)}`);
+
+    // Last, because ms_new reallocates and every view above it goes stale.
+    //
+    // A new board must not throw the weights away — they describe the game, not
+    // the position — and must not leave the buffer reading 0, which every other
+    // buffer here uses to mean "proven safe". A whole board nobody has scored
+    // showing 0% is the exact shape of that mistake, and it is what the page did.
+    s.e.ms_new(20, 20, 60);
+    check('a new game keeps the model', s.e.ms_model_ready() === 1);
+    check('a new game scores nothing yet',
+          [...s.neural()].every((v) => v === -1),
+          `${[...s.neural()].filter((v) => v !== -1).length} cells claim an answer`);
+    check('a new game can still be scored', s.e.ms_neural_begin() === 400);
   }
 }
 

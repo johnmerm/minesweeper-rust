@@ -61,6 +61,14 @@ const STAT_CACHE_HITS: usize = 7;
 const STAT_CACHE_MISSES: usize = 8;
 const STAT_LEN: usize = 9;
 
+/// What a cell the network has not reached yet reads in `ms_neural_probs_ptr`.
+///
+/// Deliberately not zero. Zero is a probability the network can genuinely
+/// return, and in every other buffer here it means *proven safe* — so a buffer
+/// that started at zero would show a whole board the network had never looked at
+/// as one it had declared harmless.
+const NOT_SCORED: f32 = -1.0;
+
 /// Cell encodings written into the buffer returned by [`ms_cells_ptr`].
 mod cell_code {
     /// `0..=8` are visible cells showing that neighbour-mine count.
@@ -106,7 +114,7 @@ impl AppState {
             exact: ConstraintSearch::new(),
             network: None,
             incoming: Vec::new(),
-            neural_probs: vec![0.0; width * height],
+            neural_probs: vec![NOT_SCORED; width * height],
             scoring: None,
         };
         state.sync_cells();
@@ -332,7 +340,13 @@ pub extern "C" fn ms_new(width: u32, height: u32, mines: u32) {
     let w = (width as usize).clamp(3, MAX_DIM);
     let h = (height as usize).clamp(3, MAX_DIM);
     let m = (mines as usize).clamp(1, w * h - 1);
-    with_state(|state| *state = AppState::new(w, h, m));
+    with_state(|state| {
+        // The weights describe the game, not this board, and fetching them again
+        // costs half a megabyte. Everything else starts over.
+        let network = state.network.take();
+        *state = AppState::new(w, h, m);
+        state.network = network;
+    });
 }
 
 #[no_mangle]
@@ -480,7 +494,7 @@ pub extern "C" fn ms_neural_begin() -> u32 {
             return 0;
         };
         state.neural_probs.clear();
-        state.neural_probs.resize(state.game.width * state.game.height, -1.0);
+        state.neural_probs.resize(state.game.width * state.game.height, NOT_SCORED);
         let scorer = network.scorer(&state.game);
         let total = scorer.remaining() as u32;
         state.scoring = Some(scorer);

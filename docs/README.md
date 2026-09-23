@@ -84,7 +84,10 @@ It drives the same ABI the page uses — no npm install needed.
   happened to put a mine there.
 - **Neural overlay** puts a second number in the top-left of each cell, in
   purple: what the trained convolutional network thinks, beside what the solver
-  proved. The network sees only a 9x9 patch around a cell, so it is a guess and
+  proved. It is on from the start — comparing the two is the point — and the
+  button turns it off. It does not start by itself on boards over about 4 000
+  cells, where a full pass would keep a core busy between clicks; the button
+  still turns it on there. The network sees only a 9x9 patch around a cell, so it is a guess and
   never a proof — it is there to be compared with the exact value, not trusted
   instead of it.
 

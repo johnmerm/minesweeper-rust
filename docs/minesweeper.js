@@ -33,6 +33,9 @@
   // 'unavailable' — the page works perfectly well without a model, so failing to
   // find one is a state rather than an error.
   var neuralState = 'off';
+  // Whether being on is this page's idea or the player's. Only the automatic
+  // case gets reconsidered when the board changes size.
+  var neuralChoice = 'auto';
   var neuralFrame = null;
   var neuralLeft = 0, neuralTotal = 0;
   var neuralChunk = 4;        // cells per step call, adapted to the frame budget
@@ -45,6 +48,11 @@
   // than the handful of network passes a frame fits. Repainting a few times a
   // second still reads as filling in, and leaves the frame to the work.
   var REPAINT_EVERY_MS = 120;
+  // The overlay comes on by itself up to this many cells. A full pass is a
+  // forward pass per cell and restarts on every move, so on a 200x200 board it
+  // would keep a core busy for minutes between clicks without being asked. Above
+  // the cap the button still turns it on.
+  var NEURAL_AUTO_MAX_CELLS = 4096;
 
   var el = {
     grid: document.getElementById('grid'),
@@ -58,7 +66,8 @@
     height: document.getElementById('in-height'),
     mines: document.getElementById('in-mines'),
     strategy: document.getElementById('in-strategy'),
-    neuralNote: document.getElementById('neural-note')
+    neuralNote: document.getElementById('neural-note'),
+    neuralBtn: document.getElementById('btn-neural')
   };
 
   /* ---------------------------------------------------------------- loading */
@@ -375,23 +384,13 @@
     neuralError = scaled ? scaled / 10000 : null;
   }
 
-  function toggleNeural(btn) {
-    if (neuralState === 'on') {
-      neuralState = 'off';
-      cancelNeural();
-      btn.classList.remove('on');
-      neuralNote('');
-      render();
-      return;
-    }
-    if (neuralState === 'loading') return;
-
+  function enableNeural() {
+    var btn = el.neuralBtn;
     var start = function () {
       neuralState = 'on';
       btn.classList.add('on');
       scheduleNeural();
     };
-
     if (wasm.ms_model_ready()) {
       start();
       return;
@@ -403,6 +402,42 @@
       btn.classList.remove('on');
       neuralNote(describeNeural() + ' (' + err.message + ')');
     });
+  }
+
+  function toggleNeural() {
+    if (neuralState === 'loading') return;
+    if (neuralState === 'on') {
+      neuralState = 'off';
+      neuralChoice = 'off';
+      cancelNeural();
+      el.neuralBtn.classList.remove('on');
+      neuralNote('');
+      render();
+      return;
+    }
+    neuralChoice = 'user';
+    enableNeural();
+  }
+
+  /**
+   * Decide the overlay for the board that was just created.
+   *
+   * On by default: both numbers side by side is the whole point, and a button
+   * nobody presses shows nothing. But a full pass is one forward pass per cell
+   * and starts again after every move, so on a 200x200 board it would keep a core
+   * busy between clicks without being asked — above the cap the automatic case
+   * stands down and says so. A player who turned it on themselves keeps it.
+   */
+  function autoNeural() {
+    if (neuralChoice !== 'auto' || neuralState === 'loading') return;
+    if (wasm.ms_width() * wasm.ms_height() <= NEURAL_AUTO_MAX_CELLS) {
+      if (neuralState === 'off') enableNeural();
+    } else if (neuralState === 'on') {
+      neuralState = 'off';
+      cancelNeural();
+      el.neuralBtn.classList.remove('on');
+      neuralNote('network: not run automatically on a board this large — the button turns it on');
+    }
   }
 
   /* ----------------------------------------------------------- game driving */
@@ -418,6 +453,9 @@
     if (pendingCompute) clearTimeout(pendingCompute);
     // Whatever the network was scoring describes a board that no longer exists.
     cancelNeural();
+    // ...and so does the count beside it, which would otherwise sit there
+    // claiming the last board's cells until the next pass starts.
+    if (neuralState === 'on') neuralNote('network: …');
     el.sim.textContent = 'calculating…';
     pendingCompute = setTimeout(function () {
       pendingCompute = null;
@@ -442,6 +480,7 @@
     startedAt = 0;
     cancelNeural();
     neuralError = null;
+    autoNeural();
     render();
     // A fresh board still has a probability: mines / cells, the same for every
     // square. Without this the grid would read 0% until the first click.
@@ -542,8 +581,7 @@
       flagBtn.classList.toggle('on', flagMode);
     });
 
-    var neuralBtn = document.getElementById('btn-neural');
-    neuralBtn.addEventListener('click', function () { toggleNeural(neuralBtn); });
+    el.neuralBtn.addEventListener('click', toggleNeural);
 
     el.strategy.addEventListener('change', scheduleCompute);
   }

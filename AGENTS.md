@@ -174,7 +174,12 @@ and no bundler** so the result can be served as static files from any host
   `ms_neural_learn` corrects the output layer from `ms_probs_ptr`, and
   `minesweeper.js` calls it only after an *exact* solve: a sampled estimate is
   noise, and the network would learn the noise. The guess never feeds
-  `ms_auto_reveal`, which acts on proof alone.
+  `ms_auto_reveal`, which acts on proof alone. The overlay is on by default up to
+  `NEURAL_AUTO_MAX_CELLS`; a board chosen by hand keeps whatever the player set.
+  `ms_new` rebuilds `AppState` but carries the loaded network over, and
+  `neural_probs` starts at `NOT_SCORED`, never `0.0` — it shipped once as `0.0`
+  and every new board then showed a full grid of 0% from a network that had not
+  looked at it.
 
 ---
 
