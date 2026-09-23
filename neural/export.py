@@ -5,13 +5,21 @@ Usage:
                             [--output neural/onnx/model.onnx]
                             [--opset 17]
 
-Asserts that max absolute difference between PyTorch and ONNX outputs is < 1e-4.
+Asserts that max absolute difference between PyTorch and ONNX outputs is < 1e-4,
+and that the result is one self-contained file.
+
+That second check exists because torch writes the weights to a sidecar
+`model.onnx.data` by default, leaving a 6 KB graph next to a 485 KB blob. Both
+onnxruntime and tract find the sidecar as long as it is in the same directory, so
+everything appears to work — right up until the `.onnx` is committed, moved or
+copied on its own, at which point it is a model with no weights in it.
 """
 
 import argparse
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import torch
 
@@ -41,7 +49,27 @@ def export(checkpoint: Path, output: Path, opset: int):
         dynamic_axes={"patch": {0: "batch"}, "prob": {0: "batch"}},
         opset_version=opset,
     )
-    print(f"Exported ONNX model to {output}")
+    # Fold any sidecar weights back into the file itself.
+    model_proto = onnx.load(str(output))  # merges external data, if there is any
+    onnx.save(model_proto, str(output), save_as_external_data=False)
+    sidecar = output.with_name(output.name + ".data")
+    if sidecar.exists():
+        sidecar.unlink()
+
+    stray = [
+        initializer.name
+        for initializer in model_proto.graph.initializer
+        if initializer.data_location != onnx.TensorProto.DEFAULT
+    ]
+    assert not stray, f"weights still held outside the file: {stray}"
+
+    weights = sum(len(i.raw_data) for i in model_proto.graph.initializer)
+    size = output.stat().st_size
+    print(f"Exported ONNX model to {output} ({size:,} bytes)")
+    assert size > weights, (
+        f"{output} is {size:,} bytes but holds {weights:,} bytes of weights — "
+        "the file does not contain its own parameters"
+    )
 
     # --- Validate ---
     with torch.no_grad():
