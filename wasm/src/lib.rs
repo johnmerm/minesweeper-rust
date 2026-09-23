@@ -61,6 +61,16 @@ const STAT_CACHE_HITS: usize = 7;
 const STAT_CACHE_MISSES: usize = 8;
 const STAT_LEN: usize = 9;
 
+/// The trained network, built into the module.
+///
+/// It could be a second file next to the `.wasm` — it started as one — but that
+/// makes the overlay depend on a static host serving a 487 KB `.bin` the way the
+/// page expects, which is one more thing between a fix and a player seeing it.
+/// The module already has zero imports and carries everything it needs; the
+/// weights are a build-time constant like any other, so they belong here. One
+/// request, one failure mode, and `standalone.html` gets them for free.
+const WEIGHTS: &[u8] = include_bytes!("../../neural/onnx/model.bin");
+
 /// What a cell the network has not reached yet reads in `ms_neural_probs_ptr`.
 ///
 /// Deliberately not zero. Zero is a probability the network can genuinely
@@ -89,8 +99,6 @@ struct AppState {
     game: Minesweeper,
     /// The neural estimator, once JavaScript has handed over its weights.
     network: Option<PatchCnn>,
-    /// Scratch space JavaScript writes the weights into.
-    incoming: Vec<u8>,
     /// The network's guess per cell, alongside `probs` from the exact search.
     neural_probs: Vec<f32>,
     /// The scoring pass in flight, if any.
@@ -113,7 +121,6 @@ impl AppState {
             stats: [0; STAT_LEN],
             exact: ConstraintSearch::new(),
             network: None,
-            incoming: Vec::new(),
             neural_probs: vec![NOT_SCORED; width * height],
             scoring: None,
         };
@@ -444,28 +451,19 @@ pub extern "C" fn ms_stats_len() -> u32 {
     STAT_LEN as u32
 }
 
-/// Reserve `len` bytes for the network's weights and return where to write them.
-#[no_mangle]
-pub extern "C" fn ms_model_buffer(len: u32) -> *mut u8 {
-    with_state(|state| {
-        state.incoming.clear();
-        state.incoming.resize(len as usize, 0);
-        state.incoming.as_mut_ptr()
-    })
-}
-
-/// Parse the bytes written into that buffer. Returns 1 on success, 0 on failure.
+/// Parse the built-in weights, if that has not happened yet.
+///
+/// Deferred rather than done in `AppState::new` so a page that never turns the
+/// overlay on never pays for it. Returns 1 once a network is ready, 0 if the
+/// weights do not parse — which would mean the architecture and the export have
+/// drifted apart, and is a build error, not something a player can cause.
 #[no_mangle]
 pub extern "C" fn ms_model_load() -> u32 {
     with_state(|state| {
-        let bytes = std::mem::take(&mut state.incoming);
-        match PatchCnn::from_bytes(&bytes) {
-            Ok(network) => {
-                state.network = Some(network);
-                1
-            }
-            Err(_) => 0,
+        if state.network.is_none() {
+            state.network = PatchCnn::from_bytes(WEIGHTS).ok();
         }
+        state.network.is_some() as u32
     })
 }
 

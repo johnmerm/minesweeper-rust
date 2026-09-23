@@ -208,27 +208,14 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
 // page depends on and nothing else exercises.
 {
   const s = await load(7, 11);
-  const weights = path.join(root, 'docs', 'model.bin');
-  if (!fs.existsSync(weights)) {
-    console.log('skip the neural overlay — no docs/model.bin');
-  } else {
+  {
     s.e.ms_new(16, 16, 40);
-    check('no model until one is loaded', s.e.ms_model_ready() === 0);
+    check('nothing is parsed until the overlay is used', s.e.ms_model_ready() === 0);
     check('scoring without a model does nothing', s.e.ms_neural_begin() === 0);
 
-    // `ms_model_buffer` can grow linear memory, which detaches every existing
-    // view onto it — so the pointer comes back first and the view is built after.
-    const writeModel = (data) => {
-      const ptr = s.e.ms_model_buffer(data.length);
-      new Uint8Array(s.e.memory.buffer, ptr, data.length).set(data);
-    };
-
-    // Nonsense must be refused rather than read as weights.
-    writeModel(new Uint8Array(64));
-    check('a file that is not a model is refused', s.e.ms_model_load() === 0);
-
-    writeModel(new Uint8Array(fs.readFileSync(weights)));
-    check('the trained weights load', s.e.ms_model_load() === 1 && s.e.ms_model_ready() === 1);
+    // The weights ship inside the module, so this is the whole loading story —
+    // no fetch, no second asset, nothing a host can serve wrongly.
+    check('the built-in weights parse', s.e.ms_model_load() === 1 && s.e.ms_model_ready() === 1);
 
     s.e.ms_reveal(8, 8);
     s.e.ms_compute(0);

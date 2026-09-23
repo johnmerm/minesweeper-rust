@@ -29,9 +29,9 @@
   var pendingCompute = null;
   var startedAt = 0, timerId = 0;
 
-  // The neural overlay. `neuralState` is one of: 'off', 'loading', 'on',
-  // 'unavailable' — the page works perfectly well without a model, so failing to
-  // find one is a state rather than an error.
+  // The neural overlay. `neuralState` is one of: 'off', 'on', 'unavailable' —
+  // the page works perfectly well without a network, so a build without usable
+  // weights is a state rather than an error.
   var neuralState = 'off';
   // Whether being on is this page's idea or the player's. Only the automatic
   // case gets reconsidered when the board changes size.
@@ -275,29 +275,6 @@
 
   /* --------------------------------------------------------- neural overlay */
 
-  /**
-   * Hand the trained weights to the module.
-   *
-   * `ms_model_buffer` may grow linear memory, so the view onto it is built after
-   * the call and never before — the same rule as every other buffer here.
-   */
-  function loadModel() {
-    var bytes = typeof MINESWEEPER_MODEL_BASE64 === 'string'
-      ? Promise.resolve(base64ToBytes(MINESWEEPER_MODEL_BASE64))
-      : fetch('model.bin' + (buildId() ? '?v=' + buildId() : ''))
-          .then(function (r) {
-            if (!r.ok) throw new Error('HTTP ' + r.status);
-            return r.arrayBuffer();
-          })
-          .then(function (buf) { return new Uint8Array(buf); });
-
-    return bytes.then(function (data) {
-      var ptr = wasm.ms_model_buffer(data.length);
-      new Uint8Array(wasm.memory.buffer, ptr, data.length).set(data);
-      if (!wasm.ms_model_load()) throw new Error('the module rejected the weights');
-    });
-  }
-
   function cancelNeural() {
     if (neuralFrame !== null) cancelAnimationFrame(neuralFrame);
     neuralFrame = null;
@@ -354,9 +331,8 @@
   }
 
   function describeNeural() {
-    if (neuralState === 'loading') return 'network: loading the model…';
     if (neuralState === 'unavailable') {
-      return 'network: no model available — run neural/export_weights.py and rebuild';
+      return 'network: this build carries no usable weights — rebuild with wasm/build.sh';
     }
     if (neuralState !== 'on') return '';
     var done = neuralTotal - neuralLeft;
@@ -384,28 +360,27 @@
     neuralError = scaled ? scaled / 10000 : null;
   }
 
+  /**
+   * Turn the overlay on.
+   *
+   * The weights live inside the module, so there is nothing to fetch and nothing
+   * to wait for: `ms_model_load` parses them the first time and says whether it
+   * worked. It can only fail if the build is broken, which is worth saying out
+   * loud rather than leaving the overlay quietly dead.
+   */
   function enableNeural() {
-    var btn = el.neuralBtn;
-    var start = function () {
-      neuralState = 'on';
-      btn.classList.add('on');
-      scheduleNeural();
-    };
-    if (wasm.ms_model_ready()) {
-      start();
+    if (!wasm.ms_model_load()) {
+      neuralState = 'unavailable';
+      el.neuralBtn.classList.remove('on');
+      neuralNote(describeNeural());
       return;
     }
-    neuralState = 'loading';
-    neuralNote(describeNeural());
-    loadModel().then(start).catch(function (err) {
-      neuralState = 'unavailable';
-      btn.classList.remove('on');
-      neuralNote(describeNeural() + ' (' + err.message + ')');
-    });
+    neuralState = 'on';
+    el.neuralBtn.classList.add('on');
+    scheduleNeural();
   }
 
   function toggleNeural() {
-    if (neuralState === 'loading') return;
     if (neuralState === 'on') {
       neuralState = 'off';
       neuralChoice = 'off';
@@ -429,7 +404,7 @@
    * stands down and says so. A player who turned it on themselves keeps it.
    */
   function autoNeural() {
-    if (neuralChoice !== 'auto' || neuralState === 'loading') return;
+    if (neuralChoice !== 'auto' || neuralState === 'unavailable') return;
     if (wasm.ms_width() * wasm.ms_height() <= NEURAL_AUTO_MAX_CELLS) {
       if (neuralState === 'off') enableNeural();
     } else if (neuralState === 'on') {

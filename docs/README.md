@@ -10,8 +10,13 @@ whole glue layer.
 | `index.html` | The page — markup and styles |
 | `minesweeper.js` | Loads the module, renders the board, handles input |
 | `minesweeper.wasm` | Built artifact, committed so the site needs no build step |
-| `model.bin` | The trained network's weights, copied here by the build |
-| `standalone.html` | Generated: the above four inlined into one file |
+| `standalone.html` | Generated: the above three inlined into one file |
+
+The trained network's weights are compiled *into* `minesweeper.wasm` rather than
+served beside it. They could be a fourth file, and were at first, but that makes
+the overlay depend on a host serving a 487 KB `.bin` the way the page expects —
+one more thing between a fix and a player seeing it. One request, one failure
+mode.
 
 `index.html` carries a build id — a hash of the built files — which
 is shown at the bottom of the page and appended to both asset URLs. These files
@@ -35,7 +40,7 @@ githack caches, so a freshly pushed build may not appear at once: hard-reload
 (Ctrl/Cmd-Shift-R), and check the build id at the foot of the page against the
 one `./wasm/build.sh` printed.
 
-`standalone.html` carries the module and the weights inlined as base64, so that
+`standalone.html` carries the module inlined as base64 — weights and all — so that
 one file also runs from a `file://` URL — download it and double-click it. `index.html` needs
 `http(s)` because browsers refuse to `fetch` a `.wasm` from `file://`.
 
@@ -102,7 +107,7 @@ It drives the same ABI the page uses — no npm install needed.
   exact solves teach it; a sampled estimate carries noise, and a network taught
   from noise learns the noise.
 
-  The weights are `model.bin`, produced by `neural/export_weights.py`. Without
-  them the button reports the overlay as unavailable and nothing else changes.
+  The weights come from `neural/export_weights.py` and are built into the module,
+  so there is nothing to load and nothing that can fail to arrive.
 - Boards go up to 200 a side. That ceiling is about the browser, not the engine:
   every cell is a DOM node, and 200x200 is 40 000 of them.
