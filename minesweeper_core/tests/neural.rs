@@ -118,3 +118,59 @@ fn the_model_loads_and_predicts() {
          the model is untrained, or the patch layout here does not match the one it saw"
     );
 }
+
+/// The two Rust readings of the same network must agree.
+///
+/// `NeuralNetwork` runs the ONNX file through tract; `PatchCnn` is the same
+/// architecture written out by hand so the WebAssembly build does not have to
+/// carry tract's 13 MB. They are fed by the same patch code and the same trained
+/// weights, so any difference between them is a mistake in one of the two — and
+/// not one that shows up as an error, since both keep returning numbers in range.
+///
+/// Needs both exports: `MINESWEEPER_ONNX` and `MINESWEEPER_WEIGHTS`.
+#[test]
+fn the_hand_written_network_agrees_with_tract() {
+    let Some(onnx_path) = model_path() else { return };
+    let weights_path = std::env::var("MINESWEEPER_WEIGHTS").unwrap_or_default();
+    if weights_path.is_empty() || !std::path::Path::new(&weights_path).exists() {
+        eprintln!("skipping: set MINESWEEPER_WEIGHTS to the .bin export as well");
+        return;
+    }
+
+    let tract = NeuralNetwork::new(&onnx_path).expect("loading the ONNX model");
+    let hand = minesweeper_core::probability::PatchCnn::from_bytes(
+        &std::fs::read(&weights_path).expect("reading the weights"),
+    )
+    .expect("parsing the weights");
+
+    let game = position();
+
+    let (tx, rx) = channel();
+    tract.calculate_with_progress(&game, tx);
+    let mut theirs = Vec::new();
+    while let Ok(update) = rx.recv() {
+        if let SimUpdate::Done { probs, .. } = update {
+            theirs = probs;
+            break;
+        }
+    }
+    let ours = hand.calculate(&game);
+
+    let mut worst = 0.0f64;
+    let mut compared = 0;
+    for y in 0..game.height {
+        for x in 0..game.width {
+            if game.grid[y][x].state == CellState::Visible {
+                continue;
+            }
+            worst = worst.max((ours[y][x] - theirs[y][x]).abs());
+            compared += 1;
+        }
+    }
+
+    assert!(compared > 0, "the position has no unopened cells to compare");
+    assert!(
+        worst < 1e-4,
+        "hand-written network and tract disagree by {worst:.2e} over {compared} cells"
+    );
+}

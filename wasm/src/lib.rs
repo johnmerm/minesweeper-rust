@@ -30,7 +30,7 @@
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 
-use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, SimUpdate};
+use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, NeuralNetwork, SimUpdate};
 use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
 
 mod rng;
@@ -79,6 +79,12 @@ const MAX_DIM: usize = 200;
 
 struct AppState {
     game: Minesweeper,
+    /// The neural estimator, once JavaScript has handed over a model.
+    network: Option<NeuralNetwork>,
+    /// Scratch space JavaScript writes the ONNX bytes into.
+    incoming: Vec<u8>,
+    /// The network's guess per cell, alongside `probs` from the exact search.
+    neural_probs: Vec<f32>,
     cells: Vec<u8>,
     probs: Vec<f32>,
     stats: [u32; STAT_LEN],
@@ -96,6 +102,9 @@ impl AppState {
             probs: vec![0.0; width * height],
             stats: [0; STAT_LEN],
             exact: ConstraintSearch::new(),
+            network: None,
+            incoming: Vec::new(),
+            neural_probs: vec![0.0; width * height],
         };
         state.sync_cells();
         state
@@ -416,4 +425,60 @@ pub extern "C" fn ms_stats_ptr() -> *const u32 {
 #[no_mangle]
 pub extern "C" fn ms_stats_len() -> u32 {
     STAT_LEN as u32
+}
+
+/// Reserve `len` bytes for an ONNX model and return where to write them.
+#[no_mangle]
+pub extern "C" fn ms_model_buffer(len: u32) -> *mut u8 {
+    with_state(|state| {
+        state.incoming.clear();
+        state.incoming.resize(len as usize, 0);
+        state.incoming.as_mut_ptr()
+    })
+}
+
+/// Parse the bytes written into that buffer. Returns 1 on success, 0 on failure.
+#[no_mangle]
+pub extern "C" fn ms_model_load() -> u32 {
+    with_state(|state| {
+        let bytes = std::mem::take(&mut state.incoming);
+        match NeuralNetwork::from_bytes(&bytes) {
+            Ok(network) => {
+                state.network = Some(network);
+                1
+            }
+            Err(_) => 0,
+        }
+    })
+}
+
+/// Pointer to `width * height` f32 network predictions. Re-read after every call.
+#[no_mangle]
+pub extern "C" fn ms_neural_probs_ptr() -> *const f32 {
+    with_state(|state| state.neural_probs.as_ptr())
+}
+
+/// Run the network over the board. Returns 1 if it ran, 0 if no model is loaded.
+#[no_mangle]
+pub extern "C" fn ms_neural_compute() -> u32 {
+    with_state(|state| {
+        let Some(network) = &state.network else { return 0 };
+        let (tx, rx) = std::sync::mpsc::channel();
+        network.calculate_with_progress(&state.game, tx);
+        let mut probs = Vec::new();
+        while let Ok(update) = rx.recv() {
+            if let SimUpdate::Done { probs: p, .. } = update {
+                probs = p;
+                break;
+            }
+        }
+        state.neural_probs.clear();
+        for y in 0..state.game.height {
+            for x in 0..state.game.width {
+                let p = probs.get(y).and_then(|row| row.get(x)).copied().unwrap_or(0.0);
+                state.neural_probs.push(p as f32);
+            }
+        }
+        1
+    })
 }

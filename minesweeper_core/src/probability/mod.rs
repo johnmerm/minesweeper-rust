@@ -2,10 +2,13 @@ use crate::Minesweeper;
 
 pub mod monte_carlo;
 pub mod components;
+pub(crate) mod patch;
+pub mod patch_cnn;
 pub mod constraint_search;
 #[cfg(feature = "neural")] pub mod neural;
 pub use monte_carlo::MonteCarlo;
 pub use constraint_search::ConstraintSearch;
+pub use patch_cnn::{PatchCnn, WeightsError};
 #[cfg(feature = "neural")] pub use neural::NeuralNetwork;
 
 pub trait ProbabilityStrategy {

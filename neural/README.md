@@ -16,7 +16,8 @@ python neural/datagen.py 200000 8   # labelled positions -> data/{train,val,test
 python neural/prepare.py            # -> data/{split}_{boards,cells,labels,ratios}.npy
 python neural/train.py --epochs 30  # -> checkpoints/best.pt
 python neural/eval.py               # how good is it, and where is it wrong?
-python neural/export.py             # -> onnx/model.onnx
+python neural/export.py             # -> onnx/model.onnx  (desktop, via tract)
+python neural/export_weights.py     # -> onnx/model.bin   (everywhere else)
 
 cargo run -p gui --features neural   # the Rust side loads the ONNX file
 ```
@@ -75,5 +76,43 @@ last step, after training had already been paid for.
 | `model.py` | PatchCNN, ~180k parameters |
 | `train.py` | Training loop, `--limit` for a quick smoke run |
 | `export.py` | Checkpoint -> ONNX, validated against onnxruntime |
+| `export_weights.py` | Checkpoint -> flat weights the Rust build reads without tract |
+| `patchcnn_reference.py` | The same forward pass in plain numpy, as the specification |
 | `eval.py` | Scores a checkpoint against the exact labels on the held-out split |
 | `check.py` | Verifies the prepared arrays against the JSONL, no torch needed |
+
+## The trained model
+
+`onnx/` holds a model trained on this branch: 60 000 positions, 6.5M cells,
+10 epochs. On the held-out split, over 380 000 cells:
+
+| | |
+|---|---|
+| mean absolute error | 0.027 |
+| median | 0.016 |
+| proven mines it calls under 10% | **0.143%** — the ones that lose games |
+| proven-safe cells it calls over 50% | 1.06% — only wasted moves |
+
+Calibration is close to honest: of the cells it scores above 0.95, 99.7% really
+are mines; of those it scores 0.30-0.50, 40% are.
+
+That 0.143% is why the exact solver stays authoritative. It is 24 cells out of
+16 771 where the solver *knew* there was a mine and the model would have opened
+it. A good approximation is still an approximation, and there is no reason to act
+on one when the exact answer takes twelve milliseconds.
+
+## Two implementations, on purpose
+
+`model.onnx` is read by tract in the desktop build. `model.bin` is the same
+weights, flattened with BatchNorm folded in, for `probability::patch_cnn` — the
+network written out by hand.
+
+The hand-written one exists because tract costs 13.4 MB in the WebAssembly build
+against a 174 KB baseline, and because owning the arithmetic means owning the
+gradient, which is what lets the network be corrected during play from the
+solver's exact answers.
+
+Being able to disagree is the risk, so three things are checked against each
+other: PyTorch, `patchcnn_reference.py`, and the Rust. `export_weights.py` writes
+`model.vectors` — patches with the outputs PyTorch gave — so the Rust test can
+verify itself with no Python present.
