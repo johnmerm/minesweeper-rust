@@ -430,3 +430,57 @@ fn probabilities_stay_calibrated_on_large_boards() {
         });
     }
 }
+
+/// The decomposition and the convolution that reassembles it are subtle enough
+/// that a handful of hand-built positions is not convincing. This walks many
+/// random mid-game positions on boards small enough to enumerate exhaustively
+/// and demands the solver agree with brute force everywhere, to within floating
+/// point noise.
+///
+/// Board sizes are kept small because the oracle is exponential in the number of
+/// unopened cells — that is the price of an obviously-correct reference.
+#[test]
+fn matches_oracle_across_random_positions() {
+    let mut checked = 0;
+    for seed in 0..25u64 {
+        for (width, height, mines) in [(6, 4, 5), (7, 4, 6), (5, 5, 6)] {
+            sweep(seed * 131 + width as u64, width, height, mines, |game| {
+                let hidden = (0..game.height)
+                    .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+                    .filter(|&(x, y)| game.grid[y][x].state != CellState::Visible)
+                    .count();
+                // Keep the oracle's work bounded, and skip positions where
+                // nothing is open yet (no constraints to decompose).
+                if hidden > 18 || hidden == game.width * game.height {
+                    return;
+                }
+                assert_matches_oracle(game, &format!("{width}x{height}/{mines} seed {seed}"));
+                checked += 1;
+            });
+        }
+    }
+    assert!(checked > 100, "only {checked} positions checked — sweep is not exercising much");
+}
+
+/// Independent regions must be combined through the global mine budget, not
+/// treated as if each had its own. A position with two separated regions and few
+/// enough mines that they compete for them is where a wrong combination shows up.
+#[test]
+fn separated_regions_compete_for_the_same_mines() {
+    // Two 1-cell-wide corridors far apart, and two mines to share between them.
+    let mut game = board(11, 3, &[(1, 1), (9, 1)]);
+    show(
+        &mut game,
+        &[
+            (0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (1, 2), (2, 2),
+            (8, 0), (9, 0), (10, 0), (8, 1), (10, 1), (8, 2), (9, 2), (10, 2),
+        ],
+    );
+    assert_matches_oracle(&game, "two corridors");
+
+    // Each corridor's single unopened cell must be a certain mine: its numbers
+    // leave no alternative, and the two mines are exactly accounted for.
+    let probs = ConstraintSearch::new().calculate(&game);
+    assert_eq!(probs[1][1], 1.0);
+    assert_eq!(probs[1][9], 1.0);
+}

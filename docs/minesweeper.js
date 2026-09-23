@@ -196,8 +196,10 @@
     if (s[STAT_CS_ATTEMPTS] > 0 || s[STAT_CS_VALID] > 0) {
       lines.push({
         used: s[STAT_USED] === MODE_CS,
-        text: 'exact: ' + s[STAT_CS_VALID].toLocaleString() + ' layouts / ' +
-              s[STAT_CS_ATTEMPTS].toLocaleString() + ' steps [' + formatBytes(s[STAT_CS_MEMORY]) + ']'
+        // "layouts" is the sum over independent regions, not the product: the
+        // solver splits the board and never enumerates the whole cross-product.
+        text: 'exact: ' + s[STAT_CS_VALID].toLocaleString() + ' region layouts / ' +
+              s[STAT_CS_ATTEMPTS].toLocaleString() + ' nodes [' + formatBytes(s[STAT_CS_MEMORY]) + ']'
       });
     }
     if (s[STAT_MC_ATTEMPTS] > 0 || s[STAT_MC_VALID] > 0) {

@@ -1,6 +1,7 @@
 use crate::Minesweeper;
 
 pub mod monte_carlo;
+pub(crate) mod components;
 pub mod constraint_search;
 #[cfg(feature = "neural")] pub mod neural;
 pub use monte_carlo::MonteCarlo;

@@ -80,6 +80,29 @@ Web front-end using **Actix-Web 4** with **Tera** templates.
 - The template renders inline `background-color` CSS and `title` tooltip attributes from those fields.
 - A small `<span class="prob-label">` shows the percentage inside each unopened cell; a JS snippet drives a status bar that updates on hover.
 
+#### Independent regions
+
+`probability::components` splits the constraint graph into groups of cells that
+share no constraint, solves each on its own, and recombines them. Enumerating the
+border as one problem walks the *Cartesian product* of those groups' solutions;
+solving them separately turns that into a sum, which is what makes a large board
+tractable at all.
+
+A group's result is deliberately not a probability but `ways[k]` (layouts using
+exactly `k` mines) and `cell_ways[c][k]`. That form is independent of the global
+mine count and of every other group, which is what lets them be combined — and
+would let them be cached across moves. `combine` does the convolution, folding in
+`C(interior, mines_left)` for the cells no number speaks about.
+
+Two things to preserve when touching this:
+
+- The scale factors in `scaled_binomials` cancel only because the same table
+  divides numerator and denominator. Never compare weights across two tables.
+- If any component exhausts its node budget the whole answer is discarded. A
+  partial depth-first walk has covered a lexicographic prefix, so a cell can read
+  0% purely because its subtree was never visited — and every caller reads 0% as
+  proof that a cell is safe to open.
+
 ### `wasm`
 
 WebAssembly front-end, built for `wasm32-unknown-unknown` with **no wasm-bindgen

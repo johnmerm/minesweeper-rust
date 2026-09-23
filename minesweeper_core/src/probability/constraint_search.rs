@@ -4,7 +4,8 @@ use std::sync::mpsc::Sender;
 use crate::Minesweeper;
 
 use super::{ProbabilityStrategy, SimUpdate, Strategy};
-use super::monte_carlo::{SimSetup, build_probs, mc_memory_estimate};
+use super::components::{combine, decompose, ComponentSolution};
+use super::monte_carlo::{build_probs, mc_memory_estimate, SimSetup};
 use super::MonteCarlo;
 
 /// Exact mine probability estimation using depth-first constraint enumeration.
@@ -80,10 +81,17 @@ impl ConstraintSearch {
         }
     }
 
+    /// Solve the board and report the result through `tx`.
+    ///
+    /// Unlike the sampling strategy this sends no intermediate snapshots. A
+    /// half-finished exact search is not a weaker answer, it is a wrong one: the
+    /// walk has covered only a lexicographic prefix of the layouts, so a cell can
+    /// read 0% purely because its subtree has not been visited, and every caller
+    /// treats 0% as proof that a cell is safe to open. The node budget bounds the
+    /// work instead.
     pub fn calculate_with_progress(&self, game: &Minesweeper, tx: Sender<SimUpdate>) {
-        // SimSetup::build extracts the list of hidden cells, constraints (numbered
-        // cell → hidden neighbours + required mine count), certain mines/safes found
-        // by constraint propagation, and the number of mines still to place.
+        let empty = || vec![vec![0.0; game.width]; game.height];
+
         let Some(setup) = SimSetup::build(game) else {
             // No hidden cells reachable (game not started yet, already won/lost, …).
             let _ = tx.send(SimUpdate::Done {
@@ -91,106 +99,96 @@ impl ConstraintSearch {
                 attempts: 0,
                 valid: 0,
                 memory_bytes: 0,
-                probs: vec![vec![0.0; game.width]; game.height],
+                probs: empty(),
             });
             return;
         };
 
-        // `n` is the number of hidden cells (indexed 0..n in `setup.hidden_cells`).
-        let n = setup.hidden_cells.len();
         let memory_bytes = cs_memory_estimate(&setup);
+        let outcome = self.solve(&setup);
 
-        // Classify hidden cells into "border" (appear in at least one constraint)
-        // and "interior" (not constrained at all).
-        let constraint_cells: HashSet<usize> = setup
-            .constraints
-            .iter()
-            .flat_map(|(neighbors, _)| neighbors.iter().copied())
-            .collect();
-        // Interior cell indices (into hidden_cells) — the ones with no numbered neighbour.
-        let interior: Vec<usize> = (0..n).filter(|i| !constraint_cells.contains(i)).collect();
-
-        // Send a progress snapshot to the GUI every 500 valid leaves so the user
-        // sees partial results while the search is still running.
-        let progress_every = 500usize;
-
-        // These are declared outside the inner block so we can use them after
-        // the `Dfs` struct is dropped (it holds a closure that borrows `tx`).
-        let mine_counts;
-        let total_weight;
-        let valid_count;
-        let step_count;
-
-        {
-            // Closure passed to Dfs::on_progress; called after every valid leaf.
-            // Returns `false` to abort the search early (e.g. if the receiver hung up).
-            let send_progress = |step: usize,
-                                 valid: u32,
-                                 counts: &[f64],
-                                 total_wt: f64,
-                                 interior_share: f64|
-             -> bool {
-                if step % progress_every != 0 {
-                    return true; // Not a reporting step — keep going.
-                }
-                // Only materialise the interior cells when actually reporting;
-                // doing it per leaf would cost more than the search itself.
-                let counts = with_interior(counts, &interior, interior_share);
-                let probs = build_probs(&counts, total_wt, &setup, game.width, game.height);
-                tx.send(SimUpdate::Progress {
-                    strategy: Strategy::ConstraintSearch,
-                    attempts: step,
-                    valid: valid as usize,
-                    max_attempts: 0, // CS has no fixed budget — runs to completion.
-                    memory_bytes,
-                    probs,
-                })
-                .is_ok() // `false` if receiver dropped → abort.
-            };
-
-            let mut dfs = Dfs::new(
-                n,
-                &setup.constraints,
-                &interior,
-                setup.mines_to_place,
-                self.max_nodes,
-                send_progress,
-            );
-            // Start the DFS from constraint index 0 (root of the search tree).
-            dfs.run(0);
-
-            // Move results out before `dfs` (and its borrow of `tx`) is dropped.
-            mine_counts = with_interior(&dfs.mine_counts, &interior, dfs.interior_weight);
-            total_weight = dfs.total_weight;
-            // A search that ran out of budget has a biased partial answer, so it
-            // reports nothing at all and the caller falls back to sampling.
-            //
-            // Zero total weight is reported the same way. It should not happen,
-            // but if it ever does, `build_probs` would hand back a grid of 0.0 —
-            // and 0.0 means "provably safe" to every caller, which is the one
-            // wrong answer that loses the game rather than merely looking odd.
-            valid_count = if dfs.exhausted || dfs.total_weight <= 0.0 {
-                0
-            } else {
-                dfs.valid_count
-            };
-            step_count = dfs.step_count;
-        } // ← `dfs` (and the `send_progress` closure holding `&tx`) dropped here.
-
-        // Send the final exact probabilities.
-        let probs = if valid_count > 0 {
-            build_probs(&mine_counts, total_weight, &setup, game.width, game.height)
-        } else {
-            vec![vec![0.0; game.width]; game.height]
+        let (probs, valid, attempts) = match outcome {
+            Some(solved) => (
+                build_probs(&solved.probabilities, 1.0, &setup, game.width, game.height),
+                solved.layouts,
+                solved.nodes,
+            ),
+            // No usable answer — the caller falls back to sampling. Reporting zero
+            // layouts is what tells it to; a grid of zeros would read as "every
+            // cell is provably safe".
+            None => (empty(), 0, 0),
         };
+
         let _ = tx.send(SimUpdate::Done {
             strategy: Strategy::ConstraintSearch,
-            attempts: step_count,
-            valid: valid_count as usize,
+            attempts,
+            valid,
             memory_bytes,
             probs,
         });
     }
+
+    /// Solve every component and combine them, or `None` if no trustworthy answer
+    /// came out.
+    fn solve(&self, setup: &SimSetup) -> Option<Solved> {
+        let components = decompose(setup);
+
+        // Cells no number speaks about. They are not searched: their probability
+        // follows from how many mines the components leave over.
+        let constrained: HashSet<usize> = components
+            .iter()
+            .flat_map(|c| c.cells.iter().copied())
+            .collect();
+        let interior: Vec<usize> = (0..setup.hidden_cells.len())
+            .filter(|i| !constrained.contains(i))
+            .collect();
+
+        // The budget is for the whole board, so components share it. A component
+        // that runs out makes the entire answer untrustworthy: its own numbers are
+        // biased, and they feed every other cell through the combination.
+        let mut remaining = self.max_nodes;
+        let mut solutions = Vec::with_capacity(components.len());
+        let mut layouts = 0usize;
+        let mut nodes = 0usize;
+
+        for component in &components {
+            let max_mines = component.cells.len().min(setup.mines_to_place);
+            let mut dfs = Dfs::new(
+                component.cells.len(),
+                &component.constraints,
+                max_mines,
+                remaining,
+                |_| true,
+            );
+            dfs.run(0);
+            if dfs.exhausted {
+                return None;
+            }
+            remaining = remaining.saturating_sub(dfs.nodes);
+            nodes += dfs.nodes;
+            layouts += dfs.valid_count as usize;
+            solutions.push(ComponentSolution {
+                ways: dfs.ways,
+                cell_ways: dfs.cell_ways,
+            });
+        }
+
+        let probabilities = combine(setup, &components, &solutions, &interior)?;
+        Some(Solved {
+            probabilities,
+            // With no constrained cells at all there is still exactly one layout:
+            // the empty one. Reporting zero would read as "no answer".
+            layouts: layouts.max(1),
+            nodes,
+        })
+    }
+}
+
+/// A trustworthy answer: one probability per uncertain hidden cell.
+struct Solved {
+    probabilities: Vec<f64>,
+    layouts: usize,
+    nodes: usize,
 }
 
 impl ProbabilityStrategy for ConstraintSearch {
@@ -199,87 +197,54 @@ impl ProbabilityStrategy for ConstraintSearch {
         let Some(setup) = SimSetup::build(game) else {
             return vec![vec![0.0; game.width]; game.height];
         };
-        let n = setup.hidden_cells.len();
-        let constraint_cells: HashSet<usize> = setup
-            .constraints
-            .iter()
-            .flat_map(|(neighbors, _)| neighbors.iter().copied())
-            .collect();
-        let interior: Vec<usize> = (0..n).filter(|i| !constraint_cells.contains(i)).collect();
-
-        // No progress callback needed — the caller blocks until done.
-        let mut dfs = Dfs::new(
-            n,
-            &setup.constraints,
-            &interior,
-            setup.mines_to_place,
-            self.max_nodes,
-            |_, _, _, _, _| true,
-        );
-        dfs.run(0);
-
-        if dfs.exhausted || dfs.total_weight <= 0.0 {
-            // No usable answer: either the walk was cut short (its partial numbers
-            // are biased) or every leaf weighed nothing. This signature has no way
-            // to say "no answer", and zeros would be read as proof of safety, so
-            // return a sampled estimate instead.
-            return MonteCarlo::new().calculate(game);
+        match self.solve(&setup) {
+            Some(solved) => {
+                build_probs(&solved.probabilities, 1.0, &setup, game.width, game.height)
+            }
+            // This signature has no way to say "no answer", and zeros would be read
+            // as proof of safety, so hand back a sampled estimate instead.
+            None => MonteCarlo::new().calculate(game),
         }
-
-        let counts = with_interior(&dfs.mine_counts, &interior, dfs.interior_weight);
-        build_probs(&counts, dfs.total_weight, &setup, game.width, game.height)
     }
 }
 
-// ---------------------------------------------------------------------------
-// DFS engine
-// ---------------------------------------------------------------------------
-
-/// Depth-first search over the constraint tree.
+/// Depth-first search over one component's constraint tree.
 ///
-/// `'a` ties the struct to the lifetime of the constraint/interior slices.
+/// `'a` ties the struct to the lifetime of the constraint slice.
 /// `F` is the progress callback type.
+///
+/// It answers a question about that component alone: for each `k`, how many of
+/// its layouts use exactly `k` mines, and in how many of those is a given cell
+/// one. The rest of the board never enters, which is what lets the caller solve
+/// components separately and combine them afterwards.
 struct Dfs<'a, F> {
-    /// Slice of (hidden-cell-indices-of-neighbours, required-mine-count) pairs,
-    /// one entry per visible numbered cell.  This is the list of constraints we
-    /// must satisfy, processed left-to-right (depth = index into this slice).
+    /// Slice of (component-local cell indices, required-mine-count) pairs, one
+    /// per visible numbered cell bearing on this component. Processed
+    /// left-to-right, so depth = index into this slice.
     constraints: &'a [(Vec<usize>, usize)],
-    /// Indices (into hidden_cells) of cells not adjacent to any numbered cell.
-    /// Their mine count is determined analytically at each leaf.
-    interior: &'a [usize],
-    /// Total mines that must be placed across ALL hidden cells.
-    mines_total: usize,
+    /// Upper bound on mines in this component: no more than it has cells, and no
+    /// more than the board has left to place.
+    max_mines: usize,
     /// Current partial assignment.  `None` = not yet decided, `Some(true)` = mine,
-    /// `Some(false)` = safe.  Indexed by hidden-cell index (0..n).
+    /// `Some(false)` = safe.  Indexed by component-local cell index.
     assignment: Vec<Option<bool>>,
-    /// Weighted mine-hit counter per hidden cell, accumulated across all valid leaves.
-    /// `mine_counts[i]` = Σ weight over all leaves where cell i is a mine.
-    /// Interior cells are *not* included here — see `interior_weight`.
-    mine_counts: Vec<f64>,
-    /// Number of border cells currently assigned as mines. Maintained as the
-    /// search walks rather than recounted at each leaf, which was O(hidden) per
-    /// leaf and dominated the whole search on a large board.
-    border_mines: usize,
+    /// `ways[k]` — layouts found so far that use exactly k mines.
+    ways: Vec<f64>,
+    /// `cell_ways[c][k]` — of those, the ones where local cell c is a mine.
+    cell_ways: Vec<Vec<f64>>,
+    /// Mines currently placed. Maintained as the search walks rather than
+    /// recounted at each leaf, which was O(cells) per leaf and dominated the
+    /// whole search on a large board.
+    mines_placed: usize,
     /// The cells behind that count, newest last, so a leaf can credit exactly the
     /// cells it placed mines on instead of scanning every cell.
     mine_cells: Vec<usize>,
-    /// Every interior cell gets the same contribution from a given leaf, so bank
-    /// it once here and spread it over them when the numbers are read out.
-    interior_weight: f64,
-    /// `weight[k]` for placing k mines among the interior cells, precomputed
-    /// because the interior never changes during a search.
-    interior_ways: Vec<f64>,
-    /// Sum of weights across all valid leaves.
-    /// Dividing `mine_counts[i]` by this gives the exact mine probability for cell i.
-    total_weight: f64,
-    /// Number of valid leaves (constraints fully satisfied, mine counts feasible).
+    /// Number of valid leaves (constraints fully satisfied).
     valid_count: u32,
-    /// Total leaves processed (valid + pruned-at-leaf level for mine-count check).
+    /// Leaves processed.
     step_count: usize,
-    /// Called after each valid leaf with `(step, valid, border_counts,
-    /// total_weight, interior_share)`; returns `false` to abort the search early.
-    /// The counts exclude interior cells, which all share `interior_share` —
-    /// materialising the full grid on every leaf would cost more than the search.
+    /// Called after each valid leaf with the running leaf count; returns `false`
+    /// to abort the search early.
     on_progress: F,
     /// Set to `true` when `on_progress` returns `false`; causes all recursion to unwind.
     aborted: bool,
@@ -297,34 +262,23 @@ struct Dfs<'a, F> {
 
 impl<'a, F> Dfs<'a, F>
 where
-    F: FnMut(usize, u32, &[f64], f64, f64) -> bool,
+    F: FnMut(usize) -> bool,
 {
     fn new(
-        n: usize,
+        cells: usize,
         constraints: &'a [(Vec<usize>, usize)],
-        interior: &'a [usize],
-        mines_total: usize,
+        max_mines: usize,
         max_nodes: usize,
         on_progress: F,
     ) -> Self {
         Self {
             constraints,
-            interior,
-            mines_total,
-            assignment: vec![None; n],       // all cells start undecided
-            mine_counts: vec![0.0; n],
-            border_mines: 0,
+            max_mines,
+            assignment: vec![None; cells],
+            ways: vec![0.0; max_mines + 1],
+            cell_ways: vec![vec![0.0; max_mines + 1]; cells],
+            mines_placed: 0,
             mine_cells: Vec::new(),
-            interior_weight: 0.0,
-            // The search places between 0 and `n - interior` mines on border
-            // cells, so the interior takes the rest: that is the only range of
-            // interior counts the weights are ever asked for.
-            interior_ways: scaled_binomials(
-                interior.len(),
-                mines_total.saturating_sub(n - interior.len()),
-                mines_total.min(interior.len()),
-            ),
-            total_weight: 0.0,
             valid_count: 0,
             step_count: 0,
             on_progress,
@@ -416,7 +370,7 @@ where
             for &cell in &unassigned {
                 self.set_cell(cell, true);
             }
-            if self.border_mines <= self.mines_total {
+            if self.mines_placed <= self.max_mines {
                 self.run(constraint_idx + 1);
             }
             self.clear_cells(&unassigned);
@@ -448,7 +402,7 @@ where
             // Global budget: a branch that has already placed more mines than the
             // board holds cannot lead anywhere. Without this the search descends
             // through every remaining constraint before noticing at the leaf.
-            if self.border_mines <= self.mines_total {
+            if self.mines_placed <= self.max_mines {
                 self.run(constraint_idx + 1);
             }
 
@@ -483,7 +437,7 @@ where
     fn set_cell(&mut self, cell: usize, mine: bool) {
         self.assignment[cell] = Some(mine);
         if mine {
-            self.border_mines += 1;
+            self.mines_placed += 1;
             self.mine_cells.push(cell);
         }
     }
@@ -496,7 +450,7 @@ where
     fn clear_cells(&mut self, cells: &[usize]) {
         for &cell in cells.iter().rev() {
             if self.assignment[cell] == Some(true) {
-                self.border_mines -= 1;
+                self.mines_placed -= 1;
                 debug_assert_eq!(self.mine_cells.last(), Some(&cell));
                 self.mine_cells.pop();
             }
@@ -506,101 +460,28 @@ where
 
     /// Called when all constraints are satisfied (we're at a leaf of the search tree).
     ///
-    /// Checks global mine-count feasibility, computes the leaf weight, and
-    /// accumulates mine probability contributions.
-    ///
-    /// This runs once per valid layout — millions of times on a dense board — so
-    /// everything here is O(mines placed) and nothing is O(board).
+    /// Records the layout against the number of mines it used. This runs once per
+    /// valid layout — millions of times on a dense board — so it is O(mines
+    /// placed) and never O(cells).
     fn process_leaf(&mut self) {
-        // How many mines remain for interior (unconstrained) cells?
-        let k_i = match self.mines_total.checked_sub(self.border_mines) {
-            Some(v) => v,
-            None => return, // More border mines than the total — impossible layout.
-        };
-
-        // Can't place k_i mines in n_i cells if k_i > n_i.
-        let n_i = self.interior.len();
-        if k_i > n_i {
-            return;
+        let k = self.mines_placed;
+        if k > self.max_mines {
+            return; // More mines than the board has left; not a real layout.
         }
 
-        // The leaf's weight = number of ways to arrange the remaining k_i mines
-        // among the n_i interior cells.  C(n_i, k_i) boards all look like this
-        // border assignment but differ in which interior cells are mines.
-        let weight = self.interior_ways[k_i];
-        self.total_weight += weight;
-        self.valid_count += 1;
-
-        // For each border cell assigned as a mine, add `weight` to its count.
-        // (All C(n_i,k_i) boards that share this border pattern have this mine here.)
+        self.ways[k] += 1.0;
         for i in 0..self.mine_cells.len() {
             let cell = self.mine_cells[i];
-            self.mine_counts[cell] += weight;
+            self.cell_ways[cell][k] += 1.0;
         }
-
-        // Interior cells: each one is a mine in k_i/n_i fraction of the C(n_i,k_i)
-        // boards, so every interior cell earns the same amount from this leaf.
-        // Bank the per-cell share instead of writing it to all of them now.
-        if n_i > 0 && k_i > 0 {
-            self.interior_weight += weight * k_i as f64 / n_i as f64;
-        }
+        self.valid_count += 1;
 
         self.step_count += 1;
         // Notify the caller; if it returns false the search is aborted.
-        if !(self.on_progress)(
-            self.step_count,
-            self.valid_count,
-            &self.mine_counts,
-            self.total_weight,
-            self.interior_weight,
-        ) {
+        if !(self.on_progress)(self.step_count) {
             self.aborted = true;
         }
     }
-}
-
-/// Spread the banked interior share back over the interior cells, producing the
-/// full per-cell counts the probability builder expects.
-fn with_interior(border_counts: &[f64], interior: &[usize], share: f64) -> Vec<f64> {
-    let mut counts = border_counts.to_vec();
-    for &i in interior {
-        counts[i] += share;
-    }
-    counts
-}
-
-/// Weights `C(n, k)` for every k in `0..=n`, rescaled to stay inside `f64`.
-///
-/// The true values do not fit: `C(2400, 1200)` is about 10^722 and a bigger board
-/// saturates to infinity, which turns the final division into NaN. Only ratios
-/// between these weights are ever used, so the whole table can be divided by any
-/// constant — this one divides by the largest weight that the search can actually
-/// reach.
-///
-/// Which weight that is matters. Dividing by the largest entry *overall* looks
-/// natural and is wrong: on a sparse board the reachable `k` sits far out in the
-/// tail, and `exp(566 - 1663)` underflows to exactly zero. Every leaf then weighs
-/// nothing, the total comes out zero, and a grid of 0% reads as "all safe" — which
-/// is how this detonated auto-reveal on a 50x50 board. So the peak is taken over
-/// `k_min..=k_max`, the range of interior mine counts the caller can hit.
-fn scaled_binomials(n: usize, k_min: usize, k_max: usize) -> Vec<f64> {
-    let mut ln_factorial = vec![0.0f64; n + 1];
-    for i in 1..=n {
-        ln_factorial[i] = ln_factorial[i - 1] + (i as f64).ln();
-    }
-    let ln_weights: Vec<f64> = (0..=n)
-        .map(|k| ln_factorial[n] - ln_factorial[k] - ln_factorial[n - k])
-        .collect();
-
-    let peak = ln_weights
-        .iter()
-        .take(k_max.min(n) + 1)
-        .skip(k_min.min(n))
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    let peak = if peak.is_finite() { peak } else { 0.0 };
-
-    ln_weights.iter().map(|&w| (w - peak).exp()).collect()
 }
 
 // ---------------------------------------------------------------------------
