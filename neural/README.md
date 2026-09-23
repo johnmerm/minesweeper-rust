@@ -15,6 +15,7 @@ pip install -r neural/requirements.txt
 python neural/datagen.py 200000 8   # labelled positions -> data/{train,val,test}.jsonl
 python neural/prepare.py            # -> data/{split}_{boards,cells,labels,ratios}.npy
 python neural/train.py --epochs 30  # -> checkpoints/best.pt
+python neural/eval.py               # how good is it, and where is it wrong?
 python neural/export.py             # -> onnx/model.onnx
 
 cargo run -p gui --features neural   # the Rust side loads the ONNX file
@@ -74,3 +75,5 @@ last step, after training had already been paid for.
 | `model.py` | PatchCNN, ~180k parameters |
 | `train.py` | Training loop, `--limit` for a quick smoke run |
 | `export.py` | Checkpoint -> ONNX, validated against onnxruntime |
+| `eval.py` | Scores a checkpoint against the exact labels on the held-out split |
+| `check.py` | Verifies the prepared arrays against the JSONL, no torch needed |
