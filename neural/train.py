@@ -60,20 +60,27 @@ def main():
         "--limit", type=int, default=0,
         help="train on at most this many samples per epoch, for a quick check",
     )
+    parser.add_argument(
+        "--val-limit", type=int, default=0,
+        help="validate on at most this many samples, for a quick check",
+    )
     args = parser.parse_args()
 
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
 
     train_ds = MinesweeperDataset(DATA_DIR / "train", augment=True)
     val_ds = MinesweeperDataset(DATA_DIR / "val", augment=False)
-    print(f"Train samples: {len(train_ds):,}  Val samples: {len(val_ds):,}")
+    print(f"Train samples: {len(train_ds):,}  Val samples: {len(val_ds):,}", flush=True)
 
     if args.limit and args.limit < len(train_ds):
         train_ds = torch.utils.data.Subset(train_ds, range(args.limit))
-        print(f"Limited to {len(train_ds):,} training samples")
+        print(f"Limited to {len(train_ds):,} training samples", flush=True)
+    if args.val_limit and args.val_limit < len(val_ds):
+        val_ds = torch.utils.data.Subset(val_ds, range(args.val_limit))
+        print(f"Limited to {len(val_ds):,} validation samples", flush=True)
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch, shuffle=True,
@@ -140,7 +147,8 @@ def main():
             f"Epoch {epoch+1:3d}/{args.epochs}  "
             f"train_loss={train_loss:.4f}  "
             f"val_bce={val_bce:.4f}  val_mae={val_mae:.4f}  "
-            f"lr={lr:.2e}{saved}"
+            f"lr={lr:.2e}{saved}",
+            flush=True,
         )
 
     print(f"\nBest val BCE: {best_val_bce:.4f}")

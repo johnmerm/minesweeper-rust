@@ -7,4 +7,12 @@ members = [
     "wasm",
     "datagen",
 ]
-resolver = "2"
+resolver = "3"
+
+# Pins dependency resolution to versions this toolchain can actually build.
+# Without it, and with Cargo.lock untracked, a fresh clone resolves every
+# transitive dependency to its newest release — which is how `--features neural`
+# came to pull in a crate requiring a newer rustc than the project uses, and stop
+# compiling. Resolver 3 reads this and picks compatible versions instead.
+[workspace.package]
+rust-version = "1.94"
