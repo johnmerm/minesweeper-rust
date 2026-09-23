@@ -1,3 +1,6 @@
 torch>=2.1
 numpy
 onnxruntime
+# torch.onnx.export needs this from torch 2.6 onward; without it `export.py` dies
+# with ModuleNotFoundError partway through, after training has already happened.
+onnxscript

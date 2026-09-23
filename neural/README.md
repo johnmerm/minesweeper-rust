@@ -22,9 +22,15 @@ cargo run -p gui --features neural   # the Rust side loads the ONNX file
 
 `prepare.py` is not optional, and is the step that was missing.
 
+Verified end to end on this branch: 60 000 positions generated, prepared,
+trained, exported, and loaded back by the Rust `neural` feature, which returns
+per-cell probabilities that vary across the board — see
+`minesweeper_core/tests/neural.rs`, which is skipped unless `MINESWEEPER_ONNX`
+points at a model.
+
 ## Why it would not train before
 
-Two things, both outside the model:
+Four things, none of them the model:
 
 **Memory.** The dataset read JSONL and kept every parsed record — about 22 KB of
 Python dicts each. The suggested 500 000 positions therefore needed ~11.5 GB
@@ -48,6 +54,15 @@ like the start of a game.
 Positions the solver cannot finish within its budget are skipped rather than
 labelled by sampling: in the output a sampled label is indistinguishable from an
 exact one, so letting one through would quietly teach the model someone's guesses.
+
+**The Rust side did not compile.** `cargo build --features neural` failed because
+a transitive dependency of tract-onnx had moved past the project's toolchain, and
+`Cargo.lock` is untracked so every clone re-resolved to it. The workspace now
+declares its `rust-version` and uses resolver 3, which picks versions that build.
+
+**And `export.py` died on a missing dependency** — `torch.onnx.export` needs
+`onnxscript` on current torch, which was not in requirements.txt. It failed at the
+last step, after training had already been paid for.
 
 ## Files
 
