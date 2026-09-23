@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use crate::Minesweeper;
@@ -167,7 +167,7 @@ impl ConstraintSearch {
         // that runs out makes the entire answer untrustworthy: its own numbers are
         // biased, and they feed every other cell through the combination.
         let mut remaining = self.max_nodes;
-        let mut solutions: Vec<Rc<ComponentSolution>> = Vec::with_capacity(components.len());
+        let mut solutions: Vec<Arc<ComponentSolution>> = Vec::with_capacity(components.len());
         let mut layouts = 0usize;
         let mut nodes = 0usize;
 
@@ -201,11 +201,11 @@ impl ConstraintSearch {
             nodes += dfs.nodes;
             layouts += dfs.valid_count as usize;
 
-            let solution = Rc::new(ComponentSolution {
+            let solution = Arc::new(ComponentSolution {
                 ways: dfs.ways,
                 cell_ways: dfs.cell_ways,
             });
-            self.cache.borrow_mut().insert(key, Rc::clone(&solution));
+            self.cache.borrow_mut().insert(key, Arc::clone(&solution));
             solutions.push(solution);
         }
 

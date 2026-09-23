@@ -40,7 +40,7 @@
 //! fall out.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::monte_carlo::SimSetup;
 
@@ -137,9 +137,12 @@ pub(crate) fn signature(component: &Component, hidden_cells: &[(usize, usize)]) 
 /// the board's components come back identical and their answers can be reused.
 /// Entries never need invalidating — see [`Signature`] — so the only reason to
 /// drop one is to bound memory.
+/// Uses `Arc` rather than `Rc` so that a solver can be owned by a server handler
+/// or moved between threads. The counts are atomic, which costs a little on each
+/// reuse and buys the type not being thread-hostile.
 #[derive(Default)]
 pub struct SolutionCache {
-    entries: HashMap<Signature, Rc<ComponentSolution>>,
+    entries: HashMap<Signature, Arc<ComponentSolution>>,
     /// Rough heap bytes held, so a long game cannot grow this without limit.
     bytes: usize,
     hits: u32,
@@ -152,11 +155,11 @@ impl SolutionCache {
     /// so tracking recency would cost more than it saves.
     const MAX_BYTES: usize = 8 << 20;
 
-    pub(crate) fn get(&mut self, signature: &Signature) -> Option<Rc<ComponentSolution>> {
+    pub(crate) fn get(&mut self, signature: &Signature) -> Option<Arc<ComponentSolution>> {
         match self.entries.get(signature) {
             Some(solution) => {
                 self.hits += 1;
-                Some(Rc::clone(solution))
+                Some(Arc::clone(solution))
             }
             None => {
                 self.misses += 1;
@@ -165,7 +168,7 @@ impl SolutionCache {
         }
     }
 
-    pub(crate) fn insert(&mut self, signature: Signature, solution: Rc<ComponentSolution>) {
+    pub(crate) fn insert(&mut self, signature: Signature, solution: Arc<ComponentSolution>) {
         let cost = signature.weight() + solution.weight();
         if self.bytes + cost > Self::MAX_BYTES {
             self.entries.clear();
@@ -269,7 +272,7 @@ fn union(parent: &mut Vec<usize>, a: usize, b: usize) {
 pub(crate) fn combine(
     setup: &SimSetup,
     components: &[Component],
-    solutions: &[Rc<ComponentSolution>],
+    solutions: &[Arc<ComponentSolution>],
     interior: &[usize],
 ) -> Option<Vec<f64>> {
     let mines_total = setup.mines_to_place;

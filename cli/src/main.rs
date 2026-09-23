@@ -4,7 +4,7 @@ use crossterm::execute;
 use crossterm::style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, enable_raw_mode, disable_raw_mode};
 use minesweeper_core::{Minesweeper, CellState, CellContent, GameState};
-use minesweeper_core::probability::{MonteCarlo, ConstraintSearch, SimUpdate};
+use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, SimUpdate};
 use std::io::{stdout, Write};
 use std::sync::mpsc::Sender;
 
@@ -42,11 +42,25 @@ fn fmt_memory(bytes: usize) -> String {
     }
 }
 
-fn compute_probs(game: &Minesweeper) -> (Vec<Vec<f64>>, String, String) {
-    let (mc_probs, mc_valid, mc_attempts, mc_mem) =
-        run_sync(|tx| MonteCarlo::new().calculate_with_progress(game, tx));
+/// Returns the probabilities, whether they are exact rather than sampled, and the
+/// two status lines.
+///
+/// The exactness flag is not cosmetic: a sampled 0% only means no draw happened
+/// to put a mine there, so auto-reveal must not act on it.
+fn compute_probs(
+    exact: &ConstraintSearch,
+    game: &Minesweeper,
+) -> (Vec<Vec<f64>>, bool, String, String) {
     let (cs_probs, cs_valid, cs_attempts, cs_mem) =
-        run_sync(|tx| ConstraintSearch::new().calculate_with_progress(game, tx));
+        run_sync(|tx| exact.calculate_with_progress(game, tx));
+
+    // Sampling only when the exact search comes back with nothing. It is slower
+    // and less accurate, so running it every time was work thrown away.
+    let (mc_probs, mc_valid, mc_attempts, mc_mem) = if cs_valid > 0 {
+        (Vec::new(), 0, 0, 0)
+    } else {
+        run_sync(|tx| MonteCarlo::new().calculate_with_progress(game, tx))
+    };
 
     let probs = if cs_valid > 0 { cs_probs } else { mc_probs };
     let mc_status = format!(
@@ -57,28 +71,56 @@ fn compute_probs(game: &Minesweeper) -> (Vec<Vec<f64>>, String, String) {
         "CS: {} layouts / {} steps  [{}]",
         cs_valid, cs_attempts, fmt_memory(cs_mem)
     );
-    (probs, mc_status, cs_status)
+    (probs, cs_valid > 0, mc_status, cs_status)
 }
 
-/// Reveal every hidden cell whose mine probability is exactly 0.
-/// Returns true if at least one cell was revealed.
-fn apply_auto_reveal(game: &mut Minesweeper, probs: &[Vec<f64>]) -> bool {
+/// Open every cell that can be proven safe, and flag every cell proven to be a
+/// mine. Returns true if anything was opened.
+///
+/// Iterates on constraint propagation, which proves what local rules can with no
+/// search at all, and only consults `probs` — one full solve, already paid for by
+/// the caller — once propagation has run dry. Re-solving after every pass is what
+/// made this take half a minute on a dense board.
+fn apply_auto_reveal(game: &mut Minesweeper, probs: &[Vec<f64>], probs_are_exact: bool) -> bool {
     if game.state != GameState::Playing || !game.mines_generated {
         return false;
     }
-    let to_reveal: Vec<(usize, usize)> = (0..game.height)
-        .flat_map(|y| (0..game.width).map(move |x| (x, y)))
-        .filter(|&(x, y)| {
-            game.grid[y][x].state == CellState::Hidden && probs[y][x] < 1e-9
-        })
-        .collect();
-    if to_reveal.is_empty() {
-        return false;
+
+    let mut opened = 0;
+    loop {
+        let proven = certain_cells(game);
+        let mut this_pass = 0;
+        for (x, y) in proven.safe {
+            if game.grid[y][x].state == CellState::Hidden {
+                game.reveal(x, y);
+                this_pass += 1;
+            }
+        }
+        for (x, y) in proven.mines {
+            if game.grid[y][x].state == CellState::Hidden {
+                game.toggle_flag(x, y);
+            }
+        }
+        opened += this_pass;
+        if this_pass == 0 || game.state != GameState::Playing {
+            break;
+        }
     }
-    for (x, y) in to_reveal {
-        game.reveal(x, y);
+
+    // A sampled 0% means only that no draw happened to place a mine there, so it
+    // is never grounds for opening a cell.
+    if opened == 0 && probs_are_exact && game.state == GameState::Playing {
+        let safe: Vec<(usize, usize)> = (0..game.height)
+            .flat_map(|y| (0..game.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| game.grid[y][x].state == CellState::Hidden && probs[y][x] < 1e-9)
+            .collect();
+        for (x, y) in safe {
+            game.reveal(x, y);
+            opened += 1;
+        }
     }
-    true
+
+    opened > 0
 }
 
 fn parse_args() -> (usize, usize, usize) {
@@ -98,7 +140,9 @@ fn main() -> std::io::Result<()> {
     let mut cursor_x = 0usize;
     let mut cursor_y = 0usize;
     let mut auto_reveal = false;
-    let (mut probs, mut mc_status, mut cs_status) = compute_probs(&game);
+    // One solver for the whole session: it caches region solutions between moves.
+    let exact = ConstraintSearch::new();
+    let (mut probs, mut probs_exact, mut mc_status, mut cs_status) = compute_probs(&exact, &game);
 
     enable_raw_mode()?;
     let mut stdout = stdout();
@@ -186,10 +230,10 @@ fn main() -> std::io::Result<()> {
                         KeyCode::Char(' ') => {
                             if game.state == GameState::Playing {
                                 game.reveal(cursor_x, cursor_y);
-                                (probs, mc_status, cs_status) = compute_probs(&game);
+                                (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                                 if auto_reveal {
-                                    while apply_auto_reveal(&mut game, &probs) {
-                                        (probs, mc_status, cs_status) = compute_probs(&game);
+                                    while apply_auto_reveal(&mut game, &probs, probs_exact) {
+                                        (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                                     }
                                 }
                             }
@@ -197,10 +241,10 @@ fn main() -> std::io::Result<()> {
                         KeyCode::Char('f') => {
                             if game.state == GameState::Playing {
                                 game.toggle_flag(cursor_x, cursor_y);
-                                (probs, mc_status, cs_status) = compute_probs(&game);
+                                (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                                 if auto_reveal {
-                                    while apply_auto_reveal(&mut game, &probs) {
-                                        (probs, mc_status, cs_status) = compute_probs(&game);
+                                    while apply_auto_reveal(&mut game, &probs, probs_exact) {
+                                        (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                                     }
                                 }
                             }
@@ -209,8 +253,8 @@ fn main() -> std::io::Result<()> {
                             auto_reveal = !auto_reveal;
                             // Apply immediately if turned on mid-game.
                             if auto_reveal {
-                                while apply_auto_reveal(&mut game, &probs) {
-                                    (probs, mc_status, cs_status) = compute_probs(&game);
+                                while apply_auto_reveal(&mut game, &probs, probs_exact) {
+                                    (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                                 }
                             }
                         },
@@ -218,7 +262,7 @@ fn main() -> std::io::Result<()> {
                             game = Minesweeper::new(init_w, init_h, init_m);
                             cursor_x = 0;
                             cursor_y = 0;
-                            (probs, mc_status, cs_status) = compute_probs(&game);
+                            (probs, probs_exact, mc_status, cs_status) = compute_probs(&exact, &game);
                         },
                         _ => {}
                     }
