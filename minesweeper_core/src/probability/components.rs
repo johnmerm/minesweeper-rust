@@ -70,8 +70,12 @@ pub(crate) fn decompose(setup: &SimSetup) -> Vec<Component> {
     let n = setup.hidden_cells.len();
     let mut parent: Vec<usize> = (0..n).collect();
 
+    // `SimSetup::build` drops constraints with no hidden neighbours, but that is
+    // its invariant, not ours, and the grouping below indexes `cells[0]`.
+    let constraints = || setup.constraints.iter().filter(|(cells, _)| !cells.is_empty());
+
     // Union every pair of cells that appear in the same constraint.
-    for (cells, _) in &setup.constraints {
+    for (cells, _) in constraints() {
         for &cell in cells.iter().skip(1) {
             union(&mut parent, cells[0], cell);
         }
@@ -79,7 +83,7 @@ pub(crate) fn decompose(setup: &SimSetup) -> Vec<Component> {
 
     // Group the constraints by the root of the cells they touch.
     let mut by_root: HashMap<usize, Component> = HashMap::new();
-    for (cells, required) in &setup.constraints {
+    for (cells, required) in constraints() {
         let root = find(&mut parent, cells[0]);
         let component = by_root.entry(root).or_insert_with(|| Component {
             cells: Vec::new(),
@@ -89,7 +93,7 @@ pub(crate) fn decompose(setup: &SimSetup) -> Vec<Component> {
     }
 
     // Collect each component's cells, then rebase its constraints onto them.
-    for (root, component) in by_root.iter_mut() {
+    for component in by_root.values_mut() {
         let mut cells: Vec<usize> = component
             .constraints
             .iter()
@@ -97,7 +101,6 @@ pub(crate) fn decompose(setup: &SimSetup) -> Vec<Component> {
             .collect();
         cells.sort_unstable();
         cells.dedup();
-        debug_assert!(cells.iter().all(|&c| find(&mut parent.clone(), c) == *root));
 
         let local: HashMap<usize, usize> =
             cells.iter().enumerate().map(|(i, &c)| (c, i)).collect();
@@ -205,12 +208,25 @@ pub(crate) fn combine(
         }
 
         for (local, &cell) in component.cells.iter().enumerate() {
-            let numerator: f64 = solution.cell_ways[local]
+            let cell_ways = &solution.cell_ways[local];
+            let numerator: f64 = cell_ways
                 .iter()
                 .zip(&share)
                 .map(|(&ways, &share_k)| ways * share_k)
                 .sum();
-            probabilities[cell] = (numerator / total).clamp(0.0, 1.0);
+
+            // Whether a cell is *certain* is decided from the layout counts, which
+            // are exact integers, and never from the ratio. Weights are rescaled
+            // and can underflow to zero in the tails, and a zero read off the ratio
+            // would claim the cell is provably safe — proof every caller acts on by
+            // opening it. The counts cannot lie that way.
+            let never_a_mine = cell_ways.iter().all(|&ways| ways == 0.0);
+            let always_a_mine = cell_ways
+                .iter()
+                .zip(&solution.ways)
+                .all(|(&mine, &total)| mine == total);
+
+            probabilities[cell] = settle(numerator / total, never_a_mine, always_a_mine)?;
         }
     }
 
@@ -229,13 +245,50 @@ pub(crate) fn combine(
                 ways * weight_of(b) * left as f64 / interior_len as f64
             })
             .sum();
-        let probability = (numerator / total).clamp(0.0, 1.0);
+        // The interior is never certain either way: no number speaks about it, so
+        // it holds a mine in some layouts and not others unless the board is
+        // entirely decided, which `mines_total` covers below.
+        let probability = settle(numerator / total, mines_total == 0, false)?;
         for &cell in interior {
             probabilities[cell] = probability;
         }
     }
 
+    debug_assert!(
+        {
+            // However the weights are scaled, the estimates must account for
+            // exactly the mines that are out there. This one line catches a
+            // mis-scaled table, a wrong interior window and an off-by-one in the
+            // prefix/suffix chain alike.
+            let sum: f64 = probabilities.iter().sum();
+            (sum - mines_total as f64).abs() < 1e-6 * (mines_total as f64).max(1.0)
+        },
+        "probabilities sum to {} but {} mines remain",
+        probabilities.iter().sum::<f64>(),
+        mines_total
+    );
+
     Some(probabilities)
+}
+
+/// Turn a computed ratio into a reported probability without ever manufacturing
+/// a certainty out of arithmetic.
+///
+/// `None` means the arithmetic went out of range and the caller should discard
+/// the whole answer rather than show it. Otherwise a value that is certain is
+/// reported exactly, and a value that is merely very small or very large is kept
+/// strictly inside the open interval — because 0.0 and 1.0 are read as proof.
+fn settle(ratio: f64, proven_safe: bool, proven_mine: bool) -> Option<f64> {
+    if !ratio.is_finite() {
+        return None;
+    }
+    if proven_safe {
+        return Some(0.0);
+    }
+    if proven_mine {
+        return Some(1.0);
+    }
+    Some(ratio.clamp(f64::MIN_POSITIVE, 1.0 - f64::EPSILON))
 }
 
 /// `out[j]` = the convolution of the first `j` distributions; `out[0]` is the

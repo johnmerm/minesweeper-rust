@@ -33,7 +33,11 @@ use super::MonteCarlo;
 ///
 /// # Search algorithm
 ///
-/// We process constraints one at a time (depth = constraint index).
+/// The border is first split into independent groups — see [`super::components`]
+/// — and each is searched on its own, because enumerating them together walks the
+/// product of their solution counts rather than the sum.
+///
+/// Within a group we process constraints one at a time (depth = constraint index).
 /// At each level we look at the current constraint's unassigned neighbours and
 /// pick which `needed` of the `m` unassigned cells are mines — that's C(m, needed)
 /// choices.  We fix them, recurse to the next constraint, then backtrack.
@@ -41,13 +45,11 @@ use super::MonteCarlo;
 /// Because earlier constraints already fixed some cells shared with later ones,
 /// the branching factor shrinks rapidly → the tree is tiny compared with brute-force.
 ///
-/// At each *leaf* (all constraints satisfied):
-///   1. Count how many border mines were placed (`border_mines`).
-///   2. Remaining mines = `mines_total - border_mines` must sit in interior cells.
-///   3. There are C(n_interior, k_remaining) ways to do that — this is the leaf's *weight*.
-///   4. Accumulate weighted mine counts for every cell.
-///
-/// Final probability for cell `c` = (sum of weights where c is a mine) / (total weight).
+/// Each *leaf* (all of the group's constraints satisfied) is recorded against the
+/// number of mines it used, and nothing else: how likely that leaf is depends on
+/// what the rest of the board does, which is not known here. Combining the groups,
+/// and weighting by the ways the interior can hold whatever mines are left over,
+/// happens in [`super::components::combine`].
 pub struct ConstraintSearch {
     /// Search nodes to visit before giving up on being exact.
     ///
@@ -152,13 +154,18 @@ impl ConstraintSearch {
         let mut nodes = 0usize;
 
         for component in &components {
-            let max_mines = component.cells.len().min(setup.mines_to_place);
+            // Bounded by the component's own size and nothing else. Capping it at
+            // the board's remaining mines would be free today, but it would make
+            // the result depend on the rest of the board — and its independence is
+            // the whole reason components can be solved separately, and the reason
+            // one could be cached across moves. Layouts that use more mines than
+            // the board has left are discarded in the combination, where the rest
+            // of the board is actually known.
             let mut dfs = Dfs::new(
                 component.cells.len(),
                 &component.constraints,
-                max_mines,
+                component.cells.len(),
                 remaining,
-                |_| true,
             );
             dfs.run(0);
             if dfs.exhausted {
@@ -217,7 +224,7 @@ impl ProbabilityStrategy for ConstraintSearch {
 /// its layouts use exactly `k` mines, and in how many of those is a given cell
 /// one. The rest of the board never enters, which is what lets the caller solve
 /// components separately and combine them afterwards.
-struct Dfs<'a, F> {
+struct Dfs<'a> {
     /// Slice of (component-local cell indices, required-mine-count) pairs, one
     /// per visible numbered cell bearing on this component. Processed
     /// left-to-right, so depth = index into this slice.
@@ -241,12 +248,7 @@ struct Dfs<'a, F> {
     mine_cells: Vec<usize>,
     /// Number of valid leaves (constraints fully satisfied).
     valid_count: u32,
-    /// Leaves processed.
-    step_count: usize,
-    /// Called after each valid leaf with the running leaf count; returns `false`
-    /// to abort the search early.
-    on_progress: F,
-    /// Set to `true` when `on_progress` returns `false`; causes all recursion to unwind.
+    /// Set when the budget runs out; causes all recursion to unwind.
     aborted: bool,
     /// Nodes visited so far, against `max_nodes`.
     nodes: usize,
@@ -260,16 +262,12 @@ struct Dfs<'a, F> {
     exhausted: bool,
 }
 
-impl<'a, F> Dfs<'a, F>
-where
-    F: FnMut(usize) -> bool,
-{
+impl<'a> Dfs<'a> {
     fn new(
         cells: usize,
         constraints: &'a [(Vec<usize>, usize)],
         max_mines: usize,
         max_nodes: usize,
-        on_progress: F,
     ) -> Self {
         Self {
             constraints,
@@ -280,8 +278,6 @@ where
             mines_placed: 0,
             mine_cells: Vec::new(),
             valid_count: 0,
-            step_count: 0,
-            on_progress,
             aborted: false,
             nodes: 0,
             max_nodes,
@@ -475,12 +471,6 @@ where
             self.cell_ways[cell][k] += 1.0;
         }
         self.valid_count += 1;
-
-        self.step_count += 1;
-        // Notify the caller; if it returns false the search is aborted.
-        if !(self.on_progress)(self.step_count) {
-            self.aborted = true;
-        }
     }
 }
 
@@ -501,6 +491,12 @@ fn cs_memory_estimate(setup: &SimSetup) -> usize {
     // SimSetup heap (same formula as in mc_memory_estimate)
     let setup_heap = mc_memory_estimate(setup);
 
+    // The dominant term is the per-group tables: `cell_ways` holds one row of
+    // `mines + 1` counts per cell. Estimated against the whole border rather than
+    // the true split, which this function cannot see — an upper bound, since one
+    // group of n cells costs more than the same n cells split across two.
+    let tables = n * (n + 1) * 8 + (n + 1) * 8;
+
     // DFS working set: the call stack goes `c` levels deep (one per constraint).
     // At each level we allocate three temporary vectors of size ≈ avg_unassigned.
     let avg_unassigned = total_neighbors.checked_div(c).unwrap_or(0);
@@ -511,7 +507,7 @@ fn cs_memory_estimate(setup: &SimSetup) -> usize {
     let dfs_stack = c * stack_frame;
 
     let working = n          // assignment: Vec<Option<bool>> (1 byte each)
-        + n * 8              // mine_counts: Vec<f64>
+        + tables
         + dfs_stack;
 
     setup_heap + working

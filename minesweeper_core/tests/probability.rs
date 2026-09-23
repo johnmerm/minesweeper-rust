@@ -484,3 +484,34 @@ fn separated_regions_compete_for_the_same_mines() {
     assert_eq!(probs[1][1], 1.0);
     assert_eq!(probs[1][9], 1.0);
 }
+
+/// `datagen` uses `ConstraintSearch::exhaustive()` to label training data, which
+/// lifts the node budget entirely. Without a budget the layout counts are larger,
+/// so this is where the arithmetic would run out of range first — and the failure
+/// would be silent, since an out-of-range answer falls back to sampling and
+/// sampled labels look like exact ones.
+///
+/// On any board where the budgeted search completes, the unbounded one must agree
+/// with it exactly: same algorithm, more room.
+#[test]
+fn the_unbounded_search_agrees_with_the_budgeted_one() {
+    for seed in 0..10u64 {
+        for (width, height, mines) in [(16, 16, 40), (30, 16, 99), (20, 20, 80)] {
+            sweep(seed * 17 + 2, width, height, mines, |game| {
+                let budgeted = ConstraintSearch::new().calculate(game);
+                let unbounded = ConstraintSearch::exhaustive().calculate(game);
+                for y in 0..game.height {
+                    for x in 0..game.width {
+                        assert!(
+                            (budgeted[y][x] - unbounded[y][x]).abs() < 1e-9,
+                            "{width}x{height}/{mines} seed {seed}: ({x}, {y}) budgeted \
+                             {:.9} vs unbounded {:.9}",
+                            budgeted[y][x],
+                            unbounded[y][x]
+                        );
+                    }
+                }
+            });
+        }
+    }
+}
