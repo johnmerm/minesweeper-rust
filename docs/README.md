@@ -87,12 +87,28 @@ It drives the same ABI the page uses — no npm install needed.
   proven to be a mine (100%), repeating until nothing further follows. It only
   acts on proof — never on a sampled estimate, where 0% merely means no sample
   happened to put a mine there.
-- **Neural overlay** puts a second number in the top-left of each cell, in
-  purple: what the trained convolutional network thinks, beside what the solver
-  proved. It is on from the start — comparing the two is the point — and the
-  button turns it off. It does not start by itself on boards over about 4 000
-  cells, where a full pass would keep a core busy between clicks; the button
-  still turns it on there. The network sees only a 9x9 patch around a cell, so it is a guess and
+
+  On *neural network only* it follows the network instead, opening below 5% and
+  flagging above 95%. The network never returns exactly 0 or 1, so a threshold is
+  the only way to ask it the question the solver answers with proof — and acting
+  on an estimate means it will eventually open a mine. That is the point: it is
+  how you find out what the network is worth, rather than taking the validation
+  numbers on trust. The note under the board keeps the tally, and says so when it
+  detonates one. A measured run on 16x16/40: 33 opened, 16 flagged, then a mine.
+
+  Like the solver's version it stops rather than guesses. After an opening click
+  that reveals a single number, neither has anything to work from, and the note
+  says so.
+- **Show** picks which estimate is on screen: *both* (the default), *constraint
+  search only*, or *neural network only*. In *both*, the network's guess sits in
+  the top-left of each cell in purple and the solver's proof in the bottom-right.
+  In *neural network only* the solver's numbers are not merely hidden — nothing
+  reports them, hover and tooltips included — because the point of that mode is
+  to watch the network unaided, and a proved value in a tooltip is a cheat.
+
+  The network is not scored automatically on boards over about 4 000 cells, where
+  a full pass would keep a core busy between clicks; picking a mode asks for it
+  anyway. The network sees only a 9x9 patch around a cell, so it is a guess and
   never a proof — it is there to be compared with the exact value, not trusted
   instead of it.
 

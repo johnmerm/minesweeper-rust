@@ -29,17 +29,20 @@
   var pendingCompute = null;
   var startedAt = 0, timerId = 0;
 
-  // The neural overlay. `neuralState` is one of: 'off', 'on', 'unavailable' —
-  // the page works perfectly well without a network, so a build without usable
-  // weights is a state rather than an error.
-  var neuralState = 'off';
-  // Whether being on is this page's idea or the player's. Only the automatic
-  // case gets reconsidered when the board changes size.
-  var neuralChoice = 'auto';
+  // Which estimate is on screen: 'both', 'exact' or 'neural'. In 'neural' the
+  // solver's numbers are not merely hidden — nothing on the page reports them,
+  // hover and tooltips included — because the whole use of that mode is to watch
+  // the network unaided, and a proved value visible in a tooltip is a cheat.
+  var showMode = 'both';
+  // Set once the player picks a mode. Until then the choice is the page's, and
+  // the page declines to score a board too big to be worth doing unasked.
+  var showChosen = false;
+  var neuralReady = true;    // false once the build turns out to carry no weights
   var neuralFrame = null;
   var neuralLeft = 0, neuralTotal = 0;
   var neuralChunk = 4;        // cells per step call, adapted to the frame budget
   var neuralError = null;     // mean |network - exact| at the last correction
+  var neuralOpened = 0, neuralFlagged = 0;   // what the network has played, this game
   // How much of a frame the network may take. The exact values are already on
   // screen by then, so this only decides how fast the overlay fills in; anything
   // much larger and the board stops responding while it does.
@@ -53,6 +56,10 @@
   // would keep a core busy for minutes between clicks without being asked. Above
   // the cap the button still turns it on.
   var NEURAL_AUTO_MAX_CELLS = 4096;
+  // What the network has to say before auto-play acts on it. The solver answers
+  // with proof; the network never returns exactly 0 or 1, so the question has to
+  // be asked with a threshold.
+  var NEURAL_OPEN_BELOW = 50, NEURAL_FLAG_ABOVE = 950;   // per-mille
 
   var el = {
     grid: document.getElementById('grid'),
@@ -67,7 +74,7 @@
     mines: document.getElementById('in-mines'),
     strategy: document.getElementById('in-strategy'),
     neuralNote: document.getElementById('neural-note'),
-    neuralBtn: document.getElementById('btn-neural')
+    show: document.getElementById('in-show')
   };
 
   /* ---------------------------------------------------------------- loading */
@@ -170,7 +177,8 @@
     var c = cells(), p = probs();
     // -1 marks a cell the network has not reached yet, which is why the buffer
     // cannot simply start at zero: nearly-zero is a real answer here.
-    var g = neuralState === 'on' ? neuralProbs() : null;
+    var g = neuralOn() ? neuralProbs() : null;
+    var exact = showMode !== 'neural';
     var over = wasm.ms_state() !== 0;
 
     for (var i = 0; i < cellEls.length; i++) {
@@ -180,8 +188,11 @@
       if (code === HIDDEN || code === FLAGGED) {
         cls += code === FLAGGED ? ' flagged' : ' hidden';
         text = code === FLAGGED ? '⚑' : '';
-        bg = probColor(p[i]);
-        pct = Math.round(p[i] * 100) + '%';
+        // The tint follows whichever estimate is being shown, so in 'neural' the
+        // colour is the network's opinion and not a proof wearing its clothes.
+        var tint = exact ? p[i] : (g && g[i] >= 0 ? g[i] : -1);
+        bg = tint >= 0 ? probColor(tint) : '';
+        pct = exact ? Math.round(p[i] * 100) + '%' : '';
       } else if (code === VISIBLE_MINE) {
         cls += ' visible mine';
         text = '✹';
@@ -209,7 +220,9 @@
       guessLabel.textContent = guessed;
       node.className = cls;
       node.style.backgroundColor = bg;
-      node.title = pct ? 'Mine: ' + pct + (guessed ? '  network: ' + guessed : '') : '';
+      node.title = pct
+        ? 'Mine: ' + pct + (guessed ? '  network: ' + guessed : '')
+        : (guessed ? 'Network: ' + guessed : '');
       // firstChild is the text node we manage; the two trailing spans are labels.
       if (node.firstChild !== label && node.firstChild !== guessLabel) {
         node.removeChild(node.firstChild);
@@ -219,7 +232,8 @@
     }
 
     el.grid.classList.toggle('no-prob', !showProbs);
-    el.grid.classList.toggle('neural', neuralState === 'on');
+    el.grid.classList.toggle('show-exact', exact);
+    el.grid.classList.toggle('show-neural', !!g);
     renderStatus();
   }
 
@@ -296,7 +310,13 @@
    */
   function scheduleNeural() {
     cancelNeural();
-    if (neuralState !== 'on' || wasm.ms_state() !== 0) return;
+    if (!neuralOn()) return;
+    if (wasm.ms_state() !== 0) {
+      // Nothing left to score, but the tally of what the network played is the
+      // point of the exercise and must survive the end of the game.
+      neuralNote(describeNeural());
+      return;
+    }
 
     neuralTotal = wasm.ms_neural_begin();
     neuralLeft = neuralTotal;
@@ -325,22 +345,34 @@
         render();
         neuralNote(describeNeural());
       }
-      if (neuralLeft > 0) neuralFrame = requestAnimationFrame(tick);
+      if (neuralLeft > 0) {
+        neuralFrame = requestAnimationFrame(tick);
+      } else if (autoReveal && showMode === 'neural') {
+        neuralAutoPlay();
+      }
     };
     neuralFrame = requestAnimationFrame(tick);
   }
 
   function describeNeural() {
-    if (neuralState === 'unavailable') {
+    if (!neuralReady) {
       return 'network: this build carries no usable weights — rebuild with wasm/build.sh';
     }
-    if (neuralState !== 'on') return '';
+    if (showMode !== 'exact' && !neuralOn()) {
+      return 'network: not scored automatically on a board this large — pick a mode to ask for it';
+    }
+    if (!neuralOn()) return '';
     var done = neuralTotal - neuralLeft;
     var text = neuralLeft > 0
       ? 'network: ' + done.toLocaleString() + ' / ' + neuralTotal.toLocaleString() + ' cells…'
       : 'network: ' + neuralTotal.toLocaleString() + ' cells';
     if (neuralError !== null) {
       text += ' · off by ' + (neuralError * 100).toFixed(1) + ' points, corrected';
+    }
+    if (neuralOpened || neuralFlagged) {
+      text += ' · it has opened ' + neuralOpened + ' and flagged ' + neuralFlagged;
+      if (wasm.ms_state() === 2) text += ', then hit a mine';
+      if (wasm.ms_state() === 1) text += ', and won';
     }
     return text;
   }
@@ -354,65 +386,65 @@
    * the thing is any good.
    */
   function learnFromExact() {
-    if (neuralState !== 'on' || !wasm.ms_model_ready()) return;
+    if (!neuralOn() || !wasm.ms_model_ready()) return;
     if (stats()[STAT_USED] !== MODE_CS) return;
     var scaled = wasm.ms_neural_learn(20);   // rate 0.02
     neuralError = scaled ? scaled / 10000 : null;
   }
 
   /**
-   * Turn the overlay on.
+   * Whether the network should be scoring this board.
    *
    * The weights live inside the module, so there is nothing to fetch and nothing
    * to wait for: `ms_model_load` parses them the first time and says whether it
    * worked. It can only fail if the build is broken, which is worth saying out
    * loud rather than leaving the overlay quietly dead.
+   *
+   * The size guard applies only while the mode is still the page's own choice. A
+   * pass is one forward pass per cell and starts again after every move, so a
+   * 200x200 board would keep a core busy between clicks that nobody asked for —
+   * but once a player picks a mode, that *is* the asking, and it is honoured.
    */
-  function enableNeural() {
+  function neuralOn() {
+    if (showMode === 'exact' || !neuralReady) return false;
+    if (!showChosen && width * height > NEURAL_AUTO_MAX_CELLS) return false;
     if (!wasm.ms_model_load()) {
-      neuralState = 'unavailable';
-      el.neuralBtn.classList.remove('on');
-      neuralNote(describeNeural());
-      return;
+      neuralReady = false;
+      return false;
     }
-    neuralState = 'on';
-    el.neuralBtn.classList.add('on');
-    scheduleNeural();
-  }
-
-  function toggleNeural() {
-    if (neuralState === 'on') {
-      neuralState = 'off';
-      neuralChoice = 'off';
-      cancelNeural();
-      el.neuralBtn.classList.remove('on');
-      neuralNote('');
-      render();
-      return;
-    }
-    neuralChoice = 'user';
-    enableNeural();
+    return true;
   }
 
   /**
-   * Decide the overlay for the board that was just created.
+   * Let the network play, now that the whole board is scored.
    *
-   * On by default: both numbers side by side is the whole point, and a button
-   * nobody presses shows nothing. But a full pass is one forward pass per cell
-   * and starts again after every move, so on a 200x200 board it would keep a core
-   * busy between clicks without being asked — above the cap the automatic case
-   * stands down and says so. A player who turned it on themselves keeps it.
+   * The solver's auto-play runs to a fixpoint inside the module because each
+   * step is cheap. This one cannot: every pass needs the board rescored, which
+   * is seconds of work spread over frames. So one pass is applied here and the
+   * next arrives the ordinary way — `scheduleCompute` recomputes, `scheduleNeural`
+   * rescores, and this runs again off the end of it. It stops when a pass changes
+   * nothing, or when the network opens a mine, which it eventually will.
    */
-  function autoNeural() {
-    if (neuralChoice !== 'auto' || neuralState === 'unavailable') return;
-    if (wasm.ms_width() * wasm.ms_height() <= NEURAL_AUTO_MAX_CELLS) {
-      if (neuralState === 'off') enableNeural();
-    } else if (neuralState === 'on') {
-      neuralState = 'off';
-      cancelNeural();
-      el.neuralBtn.classList.remove('on');
-      neuralNote('network: not run automatically on a board this large — the button turns it on');
+  function neuralAutoPlay() {
+    var acted = wasm.ms_neural_auto(NEURAL_OPEN_BELOW, NEURAL_FLAG_ABOVE);
+    var opened = acted >>> 16, flagged = acted & 0xffff;
+    if (!opened && !flagged) {
+      neuralNote(describeNeural() + ' · nothing it is sure enough about');
+      return;
     }
+    neuralOpened += opened;
+    neuralFlagged += flagged;
+    render();
+    scheduleCompute();
+  }
+
+  function setShowMode(mode) {
+    showMode = mode;
+    showChosen = true;
+    cancelNeural();
+    render();
+    neuralNote(describeNeural());
+    scheduleNeural();
   }
 
   /* ----------------------------------------------------------- game driving */
@@ -430,12 +462,15 @@
     cancelNeural();
     // ...and so does the count beside it, which would otherwise sit there
     // claiming the last board's cells until the next pass starts.
-    if (neuralState === 'on') neuralNote('network: …');
+    if (neuralOn()) neuralNote('network: …');
     el.sim.textContent = 'calculating…';
     pendingCompute = setTimeout(function () {
       pendingCompute = null;
       wasm.ms_compute(Number(el.strategy.value));
-      if (autoReveal) wasm.ms_auto_reveal(Number(el.strategy.value));
+      // Proof-driven auto-play only when a proof is what is on screen. In
+      // 'neural' the network drives instead, which it cannot do until it has
+      // scored the board — so that runs off the end of the scoring pass.
+      if (autoReveal && showMode !== 'neural') wasm.ms_auto_reveal(Number(el.strategy.value));
       learnFromExact();
       render();
       renderSim();
@@ -455,7 +490,7 @@
     startedAt = 0;
     cancelNeural();
     neuralError = null;
-    autoNeural();
+    neuralOpened = neuralFlagged = 0;
     render();
     // A fresh board still has a probability: mines / cells, the same for every
     // square. Without this the grid would read 0% until the first click.
@@ -517,12 +552,15 @@
         el.hover.textContent = '';
         return;
       }
-      var text = 'Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%';
-      if (neuralState === 'on') {
-        var guess = neuralProbs()[i];
-        text += guess >= 0 ? ' · network: ' + (guess * 100).toFixed(1) + '%' : ' · network: …';
+      var parts = [];
+      if (showMode !== 'neural') {
+        parts.push('Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%');
       }
-      el.hover.textContent = text;
+      if (neuralOn()) {
+        var guess = neuralProbs()[i];
+        parts.push('network: ' + (guess >= 0 ? (guess * 100).toFixed(1) + '%' : '…'));
+      }
+      el.hover.textContent = parts.join(' · ');
     });
     el.grid.addEventListener('mouseleave', function () { el.hover.textContent = ''; });
 
@@ -556,7 +594,7 @@
       flagBtn.classList.toggle('on', flagMode);
     });
 
-    el.neuralBtn.addEventListener('click', toggleNeural);
+    el.show.addEventListener('change', function () { setShowMode(el.show.value); });
 
     el.strategy.addEventListener('change', scheduleCompute);
   }

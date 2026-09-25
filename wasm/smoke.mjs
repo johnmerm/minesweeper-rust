@@ -278,6 +278,61 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
           [...s.neural()].every((v) => v === -1),
           `${[...s.neural()].filter((v) => v !== -1).length} cells claim an answer`);
     check('a new game can still be scored', s.e.ms_neural_begin() === 400);
+
+    // Letting the network play is a separate export from ms_auto_reveal on
+    // purpose: it acts on an estimate, so it can open a mine. What it must never
+    // do is act on a cell nobody scored — NOT_SCORED is -1, which is below every
+    // threshold, so a half-scored board would look like a field of certainties.
+    check('it will not play a board it has not scored', s.e.ms_neural_auto(50, 950) === 0);
+  }
+}
+
+// The network playing for itself.
+//
+// An untouched board is uniform: nothing on it is under 5% or over 95%, and
+// declining to act there is correct, not a failure. So the board gets one
+// opening click to cascade, and the network takes over from there — which is
+// what the page does, since in network-only mode the solver's auto-play is not
+// run at all. Running it first would be the wrong test: once the solver has
+// taken every proven move, what is left is precisely the set of positions
+// nothing can be certain about, and the network is right to decline those too.
+{
+  const [W, H, M] = [30, 16, 99];
+  let s = null;
+  for (let seed = 1; seed <= 8 && !s; seed++) {
+    const t = await load(seed, seed * 7919);
+    t.e.ms_model_load();
+    t.e.ms_new(W, H, M);
+    t.e.ms_reveal(W >> 1, H >> 1);
+    const opened = [...t.cells()].filter((c) => c !== HIDDEN).length;
+    if (t.e.ms_state() === 0 && opened > 10) s = t;
+  }
+
+  if (!s) {
+    check('a mid-game board to hand the network', false, 'no seed produced one');
+  } else {
+    s.e.ms_compute(0);
+    s.e.ms_neural_begin();
+    while (s.e.ms_neural_step(256) > 0) { /* finish scoring */ }
+
+    let opened = 0, flagged = 0, passes = 0;
+    while (s.e.ms_state() === 0 && passes < 40) {
+      const acted = s.e.ms_neural_auto(50, 950);
+      if (!acted) break;
+      opened += acted >>> 16;
+      flagged += acted & 0xffff;
+      passes++;
+      s.e.ms_compute(0);
+      s.e.ms_neural_begin();
+      while (s.e.ms_neural_step(256) > 0) { /* rescore */ }
+    }
+    check('the network can play a board', opened + flagged > 0,
+          `${opened} opened, ${flagged} flagged over ${passes} passes, state ${s.e.ms_state()}`);
+
+    // However it ended, the board must be left consistent: the reported flag
+    // count has to match the grid it just wrote.
+    check('the board is left consistent',
+          [...s.cells()].filter((c) => c === FLAGGED).length === s.e.ms_flags());
   }
 }
 

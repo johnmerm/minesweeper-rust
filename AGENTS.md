@@ -175,8 +175,20 @@ and no bundler** so the result can be served as static files from any host
   `ms_neural_learn` corrects the output layer from `ms_probs_ptr`, and
   `minesweeper.js` calls it only after an *exact* solve: a sampled estimate is
   noise, and the network would learn the noise. The guess never feeds
-  `ms_auto_reveal`, which acts on proof alone. The overlay is on by default up to
-  `NEURAL_AUTO_MAX_CELLS`; a board chosen by hand keeps whatever the player set.
+  `ms_auto_reveal`, which acts on proof alone.
+- `ms_neural_auto(open_below, flag_above)` is the deliberate exception: auto-play
+  driven by the network's estimates, per-mille thresholds instead of proof. It is
+  a separate export from `ms_auto_reveal` precisely so the two can never be
+  confused — this one opens mines, and is meant to, because that is how the model
+  gets measured. It refuses to act unless *every* unopened cell has been scored:
+  an unreached cell reads `NOT_SCORED`, which is below every threshold and would
+  be opened as the safest cell on the board. The page reaches it only from the
+  `Show: neural network only` mode, where `ms_auto_reveal` is not called at all.
+- The `Show` select drives `showMode` in `minesweeper.js` ('both' / 'exact' /
+  'neural'). In 'neural' nothing on the page reports the proved value — tint,
+  label, tooltip and hover all switch over — since the mode exists to watch the
+  network unaided. Scoring is skipped above `NEURAL_AUTO_MAX_CELLS` only while
+  the mode is still the page's own default; choosing one is the asking.
   `ms_new` rebuilds `AppState` but carries the loaded network over, and
   `neural_probs` starts at `NOT_SCORED`, never `0.0` — it shipped once as `0.0`
   and every new board then showed a full grid of 0% from a network that had not

@@ -520,6 +520,60 @@ pub extern "C" fn ms_neural_step(budget: u32) -> u32 {
     })
 }
 
+/// Auto-play from the network's guesses instead of the solver's proofs.
+///
+/// Deliberately a separate export from [`ms_auto_reveal`], which acts only on a
+/// proven 0.0 and must stay that way. This one acts on an estimate, so sooner or
+/// later it opens a mine — the model calls 0.14% of proven mines less than 10% —
+/// and that is exactly the point: it is how you find out what the network is
+/// worth, rather than taking the validation numbers on trust.
+///
+/// `open_below` and `flag_above` are per-mille, because the ABI carries no
+/// floats in. The network never returns exactly 0 or 1, so a threshold is the
+/// only way to ask it the question the solver answers with proof.
+///
+/// Returns `(opened << 16) | flagged`. It does nothing at all unless every
+/// unopened cell has been scored: an unreached cell reads `NOT_SCORED`, which is
+/// below every threshold, and would be opened as the safest cell on the board.
+#[no_mangle]
+pub extern "C" fn ms_neural_auto(open_below: u32, flag_above: u32) -> u32 {
+    with_state(|state| {
+        if state.game.state != GameState::Playing || !state.game.mines_generated {
+            return 0;
+        }
+        let (width, height) = (state.game.width, state.game.height);
+        let scored = |x: usize, y: usize| state.neural_probs[y * width + x];
+        let unopened = |x: usize, y: usize| state.game.grid[y][x].state != CellState::Visible;
+
+        let complete = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .all(|(x, y)| !unopened(x, y) || scored(x, y) >= 0.0);
+        if !complete {
+            return 0;
+        }
+
+        let open_below = open_below as f32 / 1000.0;
+        let flag_above = flag_above as f32 / 1000.0;
+        let hidden = |x: usize, y: usize| state.game.grid[y][x].state == CellState::Hidden;
+
+        // Collected before anything is applied: revealing cascades, and a cell
+        // this pass judged on is not one the next state should be judged by.
+        let to_flag: Vec<(usize, usize)> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| hidden(x, y) && scored(x, y) > flag_above)
+            .collect();
+        let to_open: Vec<(usize, usize)> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (x, y)))
+            .filter(|&(x, y)| hidden(x, y) && scored(x, y) < open_below)
+            .collect();
+
+        let flagged = state.flag_all(&to_flag);
+        let opened = state.reveal_all(&to_open);
+        state.sync_cells();
+        (opened << 16) | flagged
+    })
+}
+
 /// Teach the network from the exact probabilities currently in `ms_probs_ptr`.
 ///
 /// Every position the solver scores is a perfectly labelled example that cost
