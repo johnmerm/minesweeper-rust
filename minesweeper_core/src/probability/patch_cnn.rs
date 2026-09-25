@@ -196,8 +196,21 @@ impl PatchCnn {
     /// The gradient is the simple one: for a sigmoid output under log loss,
     /// d(loss)/d(logit) is just `prediction - target`.
     pub fn learn(&mut self, patch: &[f32], target: f32, rate: f32) -> f32 {
+        self.learn_scored(patch, target, rate).1
+    }
+
+    /// The same step, also handing back what the network said before it.
+    ///
+    /// Correcting the network costs a forward pass, and so does asking it for a
+    /// prediction — the same forward pass. A caller that wants both should not
+    /// pay twice, which is what lets the page correct the network inside the
+    /// scoring pass it was already running instead of in a second one.
+    ///
+    /// Returns `(prediction before the step, |prediction - target|)`.
+    pub fn learn_scored(&mut self, patch: &[f32], target: f32, rate: f32) -> (f32, f32) {
         let activations = self.run(patch);
         let error = activations.probability - target;
+        let before = activations.probability;
 
         let output = self.linears.last_mut().expect("the head is always present");
         for (weight, feature) in output.weight.iter_mut().zip(&activations.hidden2) {
@@ -206,7 +219,7 @@ impl PatchCnn {
         output.bias[0] -= rate * error;
 
         let _ = activations.head_input; // kept for a future deeper update
-        error.abs()
+        (before, error.abs())
     }
 
     /// P(mine) for every unopened cell, as a grid. Opened cells read 0.
@@ -258,6 +271,8 @@ impl PatchCnn {
             cells,
             next: 0,
             patch: vec![0.0f32; PATCH_LEN],
+            error_sum: 0.0,
+            learned: 0,
         }
     }
 
@@ -378,6 +393,8 @@ pub struct BoardScorer {
     cells: Vec<(usize, usize)>,
     next: usize,
     patch: Vec<f32>,
+    error_sum: f32,
+    learned: usize,
 }
 
 impl BoardScorer {
@@ -400,5 +417,43 @@ impl BoardScorer {
         }
         self.next = end;
         scored
+    }
+
+    /// Score up to `budget` more cells, correcting the network as it goes.
+    ///
+    /// `targets` is indexed like `out` and holds the exact probabilities; only
+    /// cells the caller has a real answer for should be trained on. Because
+    /// `learn_scored` returns the prediction it just made, this costs a single
+    /// forward pass per cell — the same as scoring — so correction is free to
+    /// ride the pass the caller was already spreading over frames rather than
+    /// blocking on a second one. That matters: a whole-board correction on a
+    /// 40x40 board measured 4.2 seconds, on every move.
+    pub fn step_training(
+        &mut self,
+        network: &mut PatchCnn,
+        budget: usize,
+        out: &mut [f32],
+        targets: &[f32],
+        rate: f32,
+    ) -> usize {
+        let end = self.cells.len().min(self.next.saturating_add(budget));
+        let scored = end - self.next;
+
+        for &(x, y) in &self.cells[self.next..end] {
+            self.patch.iter_mut().for_each(|v| *v = 0.0);
+            self.source.fill(x, y, &mut self.patch);
+            let index = y * self.width + x;
+            let (prediction, error) = network.learn_scored(&self.patch, targets[index], rate);
+            out[index] = prediction;
+            self.error_sum += error;
+            self.learned += 1;
+        }
+        self.next = end;
+        scored
+    }
+
+    /// Mean |prediction - exact| over the cells trained on so far, if any.
+    pub fn mean_error(&self) -> Option<f32> {
+        (self.learned > 0).then(|| self.error_sum / self.learned as f32)
     }
 }

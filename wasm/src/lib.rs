@@ -103,6 +103,8 @@ struct AppState {
     neural_probs: Vec<f32>,
     /// The scoring pass in flight, if any.
     scoring: Option<BoardScorer>,
+    /// Learning rate for that pass; zero scores without correcting.
+    learn_rate: f32,
     cells: Vec<u8>,
     probs: Vec<f32>,
     stats: [u32; STAT_LEN],
@@ -123,6 +125,7 @@ impl AppState {
             network: None,
             neural_probs: vec![NOT_SCORED; width * height],
             scoring: None,
+            learn_rate: 0.0,
         };
         state.sync_cells();
         state
@@ -479,13 +482,24 @@ pub extern "C" fn ms_neural_probs_ptr() -> *const f32 {
     with_state(|state| state.neural_probs.as_ptr())
 }
 
-/// Start scoring the board. Returns the number of cells that will be scored.
+/// Start scoring the board, optionally correcting the network as it goes.
+///
+/// `rate_millis` is the learning rate x1000; zero scores without training. The
+/// targets are whatever is in `ms_probs_ptr`, so the caller must only pass a
+/// non-zero rate after an *exact* solve — a sampled estimate is noise, and a
+/// network taught from noise learns the noise.
+///
+/// Training rides the scoring pass rather than running as a second one, because
+/// the forward pass is the same forward pass. Done separately over a whole board
+/// it measured 4.2 seconds on 40x40, blocking the page on every move.
+///
+/// Returns the number of cells that will be scored.
 ///
 /// Any pass already running is abandoned: it was measuring a board that no longer
 /// exists, and half of one position beside half of another is not a reading of
 /// anything.
 #[no_mangle]
-pub extern "C" fn ms_neural_begin() -> u32 {
+pub extern "C" fn ms_neural_begin(rate_millis: u32) -> u32 {
     with_state(|state| {
         let Some(network) = &state.network else {
             state.scoring = None;
@@ -496,7 +510,27 @@ pub extern "C" fn ms_neural_begin() -> u32 {
         let scorer = network.scorer(&state.game);
         let total = scorer.remaining() as u32;
         state.scoring = Some(scorer);
+        // Before the first reveal every cell carries the same prior, which
+        // teaches the network nothing and would drag it towards the mean.
+        state.learn_rate = if state.game.mines_generated {
+            rate_millis as f32 / 1000.0
+        } else {
+            0.0
+        };
         total
+    })
+}
+
+/// Mean |network - exact| over the cells the current pass has trained on,
+/// scaled by 10000 so it fits an integer return. Zero when not training.
+#[no_mangle]
+pub extern "C" fn ms_neural_error() -> u32 {
+    with_state(|state| {
+        state
+            .scoring
+            .as_ref()
+            .and_then(|scorer| scorer.mean_error())
+            .map_or(0, |error| (error * 10_000.0) as u32)
     })
 }
 
@@ -508,15 +542,16 @@ pub extern "C" fn ms_neural_begin() -> u32 {
 #[no_mangle]
 pub extern "C" fn ms_neural_step(budget: u32) -> u32 {
     with_state(|state| {
-        let (Some(network), Some(scorer)) = (&state.network, &mut state.scoring) else {
+        let AppState { network, scoring, neural_probs, probs, learn_rate, .. } = state;
+        let (Some(network), Some(scorer)) = (network, scoring) else {
             return 0;
         };
-        scorer.step(network, budget as usize, &mut state.neural_probs);
-        let left = scorer.remaining() as u32;
-        if left == 0 {
-            state.scoring = None;
+        if *learn_rate > 0.0 {
+            scorer.step_training(network, budget as usize, neural_probs, probs, *learn_rate);
+        } else {
+            scorer.step(network, budget as usize, neural_probs);
         }
-        left
+        scorer.remaining() as u32
     })
 }
 
@@ -574,27 +609,3 @@ pub extern "C" fn ms_neural_auto(open_below: u32, flag_above: u32) -> u32 {
     })
 }
 
-/// Teach the network from the exact probabilities currently in `ms_probs_ptr`.
-///
-/// Every position the solver scores is a perfectly labelled example that cost
-/// nothing extra to produce, so the network can be corrected as the game goes on.
-/// Only the output layer moves — see `PatchCnn::learn`. Returns the mean error
-/// before the step, scaled by 10000 so it can come back as an integer.
-#[no_mangle]
-pub extern "C" fn ms_neural_learn(rate_millis: u32) -> u32 {
-    with_state(|state| {
-        let Some(network) = &mut state.network else { return 0 };
-        if !state.game.mines_generated {
-            return 0;
-        }
-        let width = state.game.width;
-        let exact: Vec<Vec<f64>> = (0..state.game.height)
-            .map(|y| (0..width).map(|x| state.probs[y * width + x] as f64).collect())
-            .collect();
-        let rate = rate_millis as f32 / 1000.0;
-        match network.learn_from_board(&state.game, &exact, rate) {
-            Some(error) => (error * 10_000.0) as u32,
-            None => 0,
-        }
-    })
-}

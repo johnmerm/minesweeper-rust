@@ -211,7 +211,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
   {
     s.e.ms_new(16, 16, 40);
     check('nothing is parsed until the overlay is used', s.e.ms_model_ready() === 0);
-    check('scoring without a model does nothing', s.e.ms_neural_begin() === 0);
+    check('scoring without a model does nothing', s.e.ms_neural_begin(0) === 0);
 
     // The weights ship inside the module, so this is the whole loading story —
     // no fetch, no second asset, nothing a host can serve wrongly.
@@ -219,7 +219,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
 
     s.e.ms_reveal(8, 8);
     s.e.ms_compute(0);
-    const total = s.e.ms_neural_begin();
+    const total = s.e.ms_neural_begin(0);
     const hidden = [...s.cells()].filter((c) => c === HIDDEN || c === FLAGGED).length;
     check('every unopened cell is scheduled', total === hidden, `${total} vs ${hidden}`);
     check('nothing is scored before the first step',
@@ -258,13 +258,34 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
       }
       return sum / n;
     };
+    // Correction rides the scoring pass, so training is just scoring with a
+    // rate. Each pass both reports what the network said and nudges it.
     const before = errorOf(guess);
-    for (let i = 0; i < 25; i++) s.e.ms_neural_learn(100);
-    s.e.ms_neural_begin();
-    while (s.e.ms_neural_step(64) > 0) { /* score the same board again */ }
+    let reported = 0;
+    for (let i = 0; i < 10; i++) {
+      s.e.ms_neural_begin(100);
+      while (s.e.ms_neural_step(256) > 0) { /* score and correct together */ }
+      reported = s.e.ms_neural_error() / 10000;
+    }
     const after = errorOf(s.neural());
     check('learning moves the network towards the exact answer', after < before,
           `${before.toFixed(4)} → ${after.toFixed(4)}`);
+    check('the pass reports the error it saw', Math.abs(reported - after) < 0.02,
+          `reported ${reported.toFixed(4)} vs measured ${after.toFixed(4)}`);
+
+    // A rate of zero must leave the network exactly where it was. The baseline
+    // has to come from a scoring pass, not a training one: a training pass
+    // records what the network said *before* it was corrected, so the next pass
+    // legitimately reads differently.
+    s.e.ms_neural_begin(0);
+    while (s.e.ms_neural_step(256) > 0) { /* score only */ }
+    const frozen = [...s.neural()];
+    for (let i = 0; i < 3; i++) {
+      s.e.ms_neural_begin(0);
+      while (s.e.ms_neural_step(256) > 0) { /* score only */ }
+    }
+    check('scoring without a rate changes nothing',
+          [...s.neural()].every((v, i) => v === frozen[i]) && s.e.ms_neural_error() === 0);
 
     // Last, because ms_new reallocates and every view above it goes stale.
     //
@@ -277,7 +298,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
     check('a new game scores nothing yet',
           [...s.neural()].every((v) => v === -1),
           `${[...s.neural()].filter((v) => v !== -1).length} cells claim an answer`);
-    check('a new game can still be scored', s.e.ms_neural_begin() === 400);
+    check('a new game can still be scored', s.e.ms_neural_begin(0) === 400);
 
     // Letting the network play is a separate export from ms_auto_reveal on
     // purpose: it acts on an estimate, so it can open a mine. What it must never
@@ -312,7 +333,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
     check('a mid-game board to hand the network', false, 'no seed produced one');
   } else {
     s.e.ms_compute(0);
-    s.e.ms_neural_begin();
+    s.e.ms_neural_begin(0);
     while (s.e.ms_neural_step(256) > 0) { /* finish scoring */ }
 
     let opened = 0, flagged = 0, passes = 0;
@@ -323,7 +344,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
       flagged += acted & 0xffff;
       passes++;
       s.e.ms_compute(0);
-      s.e.ms_neural_begin();
+      s.e.ms_neural_begin(0);
       while (s.e.ms_neural_step(256) > 0) { /* rescore */ }
     }
     check('the network can play a board', opened + flagged > 0,

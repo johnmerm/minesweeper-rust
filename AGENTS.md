@@ -172,10 +172,15 @@ and no bundler** so the result can be served as static files from any host
   `ms_model_load` parses them on first use. `ms_neural_begin` and
   `ms_neural_step(budget)` then score the board a few cells at a time so the page keeps its frames; `BoardScorer` puts the cells next to a number
   first. Unscored cells read `-1`, not 0 — nearly-zero is a real answer here.
-  `ms_neural_learn` corrects the output layer from `ms_probs_ptr`, and
-  `minesweeper.js` calls it only after an *exact* solve: a sampled estimate is
-  noise, and the network would learn the noise. The guess never feeds
-  `ms_auto_reveal`, which acts on proof alone.
+  `ms_neural_begin(rate_millis)` corrects the output layer from `ms_probs_ptr` as
+  it scores, because `learn_scored` and `predict` are the same forward pass —
+  correcting separately over a whole board measured 4.2 s on 40x40 and blocked
+  every move. `minesweeper.js` passes a non-zero rate only after an *exact* solve
+  (a sampled estimate is noise, and the network would learn it) and only when the
+  solver is on screen, so `Show: neural network only` runs uncorrected. A
+  training pass records what the network said *before* each update, so the next
+  pure scoring pass legitimately reads differently. `ms_neural_error` reports the
+  mean gap. The guess never feeds `ms_auto_reveal`, which acts on proof alone.
 - `ms_neural_auto(open_below, flag_above)` is the deliberate exception: auto-play
   driven by the network's estimates, per-mille thresholds instead of proof. It is
   a separate export from `ms_auto_reveal` precisely so the two can never be

@@ -119,9 +119,18 @@ It drives the same ABI the page uses — no npm install needed.
 
   Whenever the exact solver finishes a position, its answers are used to correct
   the network's output layer — a perfectly labelled example that cost nothing
-  extra to produce. The note under the board reports how far off it was. Only
-  exact solves teach it; a sampled estimate carries noise, and a network taught
-  from noise learns the noise.
+  extra to produce. The note under the board reports how far off it was.
+
+  Two things gate that. Only exact solves teach it: a sampled estimate carries
+  noise, and a network taught from noise learns the noise. And only the modes
+  where the solver is on screen — under *neural network only* the note reads
+  *uncorrected*, because a network being corrected by the solver mid-run is not
+  the thing that mode exists to measure.
+
+  The correction rides the scoring pass rather than running as a second one, for
+  the good reason that it is the same forward pass. Done separately over a whole
+  board it measured 4.2 seconds on 40x40, blocking the page on every move; folded
+  in, the worst frame it costs is about 15 ms.
 
   The weights come from `neural/export_weights.py` and are built into the module,
   so there is nothing to load and nothing that can fail to arrive.

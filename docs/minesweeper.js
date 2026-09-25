@@ -318,7 +318,7 @@
       return;
     }
 
-    neuralTotal = wasm.ms_neural_begin();
+    neuralTotal = wasm.ms_neural_begin(learningRate());
     neuralLeft = neuralTotal;
     if (!neuralTotal) {
       render();
@@ -342,6 +342,8 @@
       var now = performance.now();
       if (neuralLeft === 0 || now - painted_at > REPAINT_EVERY_MS) {
         painted_at = now;
+        var scaled = wasm.ms_neural_error();
+        neuralError = scaled ? scaled / 10000 : null;
         render();
         neuralNote(describeNeural());
       }
@@ -368,6 +370,8 @@
       : 'network: ' + neuralTotal.toLocaleString() + ' cells';
     if (neuralError !== null) {
       text += ' · off by ' + (neuralError * 100).toFixed(1) + ' points, corrected';
+    } else if (showMode === 'neural') {
+      text += ' · uncorrected';
     }
     if (neuralOpened || neuralFlagged) {
       text += ' · it has opened ' + neuralOpened + ' and flagged ' + neuralFlagged;
@@ -378,18 +382,17 @@
   }
 
   /**
-   * Correct the network from the position just solved.
+   * How hard to correct the network during the next scoring pass, or 0.
    *
-   * Only from an exact solve: the sampled estimator's numbers carry noise, and a
-   * network taught from noise learns the noise. `ms_neural_learn` returns the
-   * mean error before the step, which is the only feedback there is on whether
-   * the thing is any good.
+   * Two gates. Only after an *exact* solve: the sampled estimator's numbers carry
+   * noise, and a network taught from noise learns the noise. And only in the
+   * modes where the solver is on screen — in 'neural' the whole point is to see
+   * what the network does unaided, and a network being corrected by the solver
+   * mid-run is not the thing being measured.
    */
-  function learnFromExact() {
-    if (!neuralOn() || !wasm.ms_model_ready()) return;
-    if (stats()[STAT_USED] !== MODE_CS) return;
-    var scaled = wasm.ms_neural_learn(20);   // rate 0.02
-    neuralError = scaled ? scaled / 10000 : null;
+  function learningRate() {
+    if (showMode === 'neural') return 0;
+    return stats()[STAT_USED] === MODE_CS ? 20 : 0;   // rate 0.02
   }
 
   /**
@@ -441,6 +444,9 @@
   function setShowMode(mode) {
     showMode = mode;
     showChosen = true;
+    // Whatever the last correction measured describes a mode we may have just
+    // left, so it stops being said the moment it stops being true.
+    neuralError = null;
     cancelNeural();
     render();
     neuralNote(describeNeural());
@@ -471,7 +477,6 @@
       // 'neural' the network drives instead, which it cannot do until it has
       // scored the board — so that runs off the end of the scoring pass.
       if (autoReveal && showMode !== 'neural') wasm.ms_auto_reveal(Number(el.strategy.value));
-      learnFromExact();
       render();
       renderSim();
       // After the exact numbers, never instead of them.
