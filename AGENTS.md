@@ -296,9 +296,20 @@ found in an earlier sweep needed 10M nodes and 540 ms.
 
 So the refusals are not intractable positions. They are positions a few times
 past an arbitrary line, and the exact answer is a few hundred milliseconds away.
-Note the shipped page falls back more often than 0.5% on that board, because it
-plays differently and reuses a warm cache; measure the configuration you care
-about before tuning to it.
+
+The shipped page refuses more often than that, because it reuses a warm cache
+and plays differently. Driving `docs/minesweeper.wasm` through 25 games per
+configuration, counting every `ms_compute`:
+
+| board | solves | sampled | worst solve |
+|---|---|---|---|
+| 30x16/99 | 190 | 1 (0.5%) | 148 ms |
+| 30x30/250 | 148 | 8 (5.4%) | 224 ms |
+| 40x40/400 | 274 | 13 (4.7%) | 245 ms |
+
+So roughly one move in twenty on a dense board currently shows sampled numbers
+that look exactly like exact ones. Six games gave 27.6% on the middle row, which
+is noise — measure enough games before tuning to a figure.
 
 #### The next step
 

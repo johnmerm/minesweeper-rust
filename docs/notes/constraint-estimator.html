@@ -153,14 +153,17 @@ let always_a_mine = cell_ways.iter().zip(&amp;solution.ways)
 <ol><li>make the exact method cover so much that the refusal is vanishingly rare, and</li><li>when it does refuse, <strong>say so</strong> — never substitute a sample and present it as the answer.</li></ol>
 <h3 id="what-that-costs-today">What that costs today</h3>
 <p>Measured on 30x30/250, playing with <code>certain_cells</code> and opening the lowest cell when propagation runs dry: 663 solves, <strong>3 refused by the node budget (0.5%)</strong>. Each of those is solvable exactly — they need 1.2M to 3.8M nodes against the 1M budget, and cost 86 ms, 86 ms and 251 ms with the budget removed. One position found in an earlier sweep needed 10M nodes and 540 ms.</p>
-<p>So the refusals are not intractable positions. They are positions a few times past an arbitrary line, and the exact answer is a few hundred milliseconds away. Note the shipped page falls back more often than 0.5% on that board, because it plays differently and reuses a warm cache; measure the configuration you care about before tuning to it.</p>
+<p>So the refusals are not intractable positions. They are positions a few times past an arbitrary line, and the exact answer is a few hundred milliseconds away.</p>
+<p>The shipped page refuses more often than that, because it reuses a warm cache and plays differently. Driving <code>docs/minesweeper.wasm</code> through 25 games per configuration, counting every <code>ms_compute</code>:</p>
+<table><thead><tr><th>board</th><th>solves</th><th>sampled</th><th>worst solve</th></tr></thead><tbody><tr><td>30x16/99</td><td>190</td><td>1 (0.5%)</td><td>148 ms</td></tr><tr><td>30x30/250</td><td>148</td><td>8 (5.4%)</td><td>224 ms</td></tr><tr><td>40x40/400</td><td>274</td><td>13 (4.7%)</td><td>245 ms</td></tr></tbody></table>
+<p>So roughly one move in twenty on a dense board currently shows sampled numbers that look exactly like exact ones. Six games gave 27.6% on the middle row, which is noise — measure enough games before tuning to a figure.</p>
 <h3 id="the-next-step">The next step</h3>
 <p>A dynamic program over the search frontier: merge partial assignments that agree on the cells still in play and on how many mines they have used, instead of walking each to a leaf. It is exact — it counts the same layouts, it just stops re-deriving shared suffixes — and polynomial where the border is thin, which it usually is. It would subsume decomposition rather than replace it, since disconnected groups are just frontiers that never meet.</p>
 <p>Raising <code>max_nodes</code> is the cruder version of the same goal and buys most of the measured gap; it needs the work moved off the click first, the way the neural scoring pass already is, or a few hundred milliseconds lands on the main thread.</p>
 <hr>
 <h2 id="source">Source</h2>
 <table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody><tr><td>Constraints, propagation, Monte Carlo</td><td><code>minesweeper_core/src/probability/monte_carlo.rs</code></td></tr><tr><td>Decomposition, combination, caching</td><td><code>minesweeper_core/src/probability/components.rs</code></td></tr><tr><td>The depth-first search and its budget</td><td><code>minesweeper_core/src/probability/constraint_search.rs</code></td></tr><tr><td><code>certain_cells</code></td><td><code>minesweeper_core/src/probability/mod.rs</code></td></tr><tr><td>Tests, including a brute-force oracle</td><td><code>minesweeper_core/tests/probability.rs</code></td></tr><tr><td>The Python twin used by the notebook</td><td><code>notes/minesweeper_ref.py</code></td></tr></tbody></table>
-<footer>Generated from the repository by <code>notes/render.py</code> · source 98effb7a</footer>
+<footer>Generated from the repository by <code>notes/render.py</code> · source 73fa0f5c</footer>
 </main>
 </body>
 </html>
