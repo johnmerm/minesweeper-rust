@@ -13,17 +13,22 @@ notes are converted to HTML here and the result is committed, the same way
 
 # Why the converter is hand-written
 
-The obvious tools both pull the page apart. `nbconvert --to html` emits 350 KB
-that loads MathJax, mermaid and require.js from a CDN; `markdown` is a
-dependency the rest of this repository does not need. Both contradict the one
-rule the site is built on: static files that work from anywhere, including a
-`file://` URL, with nothing fetched.
+Not because a CDN would be wrong — the pages are served from one, and referencing
+another is fine. (What `standalone.html` guarantees is that the *game* needs no
+server, which is a different claim.) Three ordinary reasons:
 
-So this is stdlib only, and covers exactly the Markdown these notes use —
-headings, paragraphs, fenced code, inline code, bold, italic, links, tables,
-lists, block quotes and rules. It is not a general Markdown implementation and
-should not be treated as one. If a note starts needing something it does not
-support, teach it that one thing.
+* `nbconvert` renders notebooks and not Markdown, so the two `.md` notes would
+  need a second converter anyway, and the two halves of the same set of notes
+  would not look alike.
+* Regenerating the site then needs a pip install. `wasm/build.sh` asks for a Rust
+  toolchain and nothing else; this keeps that true.
+* 350 KB a page against 15-35 KB.
+
+The cost is real and worth stating: this is a *partial* Markdown implementation.
+It covers exactly what these notes use — headings, paragraphs, fenced code,
+inline code, bold, italic, links, tables, lists, block quotes and rules — and
+nothing else. If a note starts needing something it does not support, teach it
+that one thing rather than assuming it works.
 """
 
 import hashlib

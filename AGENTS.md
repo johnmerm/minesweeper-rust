@@ -22,11 +22,15 @@ changing `probability/` or the training pipeline.
 
 `notes/render.py` renders them to `docs/notes/*.html`, which is what a reader
 gets from raw.githack — that host serves a `.md` as plain text, since Markdown is
-a source format and nothing on that path renders it. It is stdlib only and pulls
-nothing from a CDN, deliberately: `nbconvert --to html` loads MathJax, mermaid
-and require.js, which breaks the one rule this site is built on. `wasm/build.sh`
-runs it, so a stale rendering cannot drift from its source the way a stale
-`.wasm` would.
+a source format and nothing on that path renders it. `wasm/build.sh` runs it, so
+a stale rendering cannot drift from its source the way a stale `.wasm` would.
+
+It is stdlib only so a bare checkout can rebuild the site without a pip install,
+and so one style covers the prose pages and the notebook pages alike —
+`nbconvert` handles only the latter. Referencing a CDN would be fine; what
+`standalone.html` guarantees is that the game needs no server, not that nothing
+is ever fetched. The converter is a *partial* Markdown implementation: extend it
+for a construct it lacks rather than assuming it works.
 
 ### `minesweeper_core`
 

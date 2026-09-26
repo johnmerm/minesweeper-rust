@@ -10,9 +10,14 @@ as a notebook that runs what it describes.
 
 Both are also served as rendered HTML from `docs/notes/`, because raw.githack
 hands a `.md` to the browser as plain text — Markdown is a source format and
-nothing on that path renders it. `notes/render.py` converts them (stdlib only,
-no CDN, no `nbconvert`), and `wasm/build.sh` runs it so the rendering cannot
-drift from its source. Regenerate with `python3 notes/render.py`.
+nothing on that path renders it. `notes/render.py` converts them, and
+`wasm/build.sh` runs it so the rendering cannot drift from its source.
+Regenerate with `python3 notes/render.py`.
+
+That converter is stdlib only, which means a bare checkout can rebuild the site
+with no pip install, and one style covers the prose pages and the notebook pages
+alike. It is a *partial* Markdown implementation covering what these notes use;
+its docstring says what, and says to extend it rather than assume.
 
 The notebooks are committed with their outputs, so they read fine on GitHub
 without running anything. To run them:
