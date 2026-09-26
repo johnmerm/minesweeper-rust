@@ -20,6 +20,14 @@ describe against the committed weights and check themselves against a
 brute-force oracle, the Rust engine and PyTorch's own outputs. Read those before
 changing `probability/` or the training pipeline.
 
+`notes/render.py` renders them to `docs/notes/*.html`, which is what a reader
+gets from raw.githack — that host serves a `.md` as plain text, since Markdown is
+a source format and nothing on that path renders it. It is stdlib only and pulls
+nothing from a CDN, deliberately: `nbconvert --to html` loads MathJax, mermaid
+and require.js, which breaks the one rule this site is built on. `wasm/build.sh`
+runs it, so a stale rendering cannot drift from its source the way a stale
+`.wasm` would.
+
 ### `minesweeper_core`
 
 The single source of truth for all game state and logic.

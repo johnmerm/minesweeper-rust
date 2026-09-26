@@ -8,6 +8,12 @@ as a notebook that runs what it describes.
 | [`constraint-estimator.md`](constraint-estimator.md) · [`.ipynb`](constraint-estimator.ipynb) | The exact solver: constraints, propagation, independent regions, and the two traps that made it silently wrong |
 | [`neural-estimator.md`](neural-estimator.md) · [`.ipynb`](neural-estimator.ipynb) | The CNN: architecture, how it was trained, how good it is, and the correction it gets during play |
 
+Both are also served as rendered HTML from `docs/notes/`, because raw.githack
+hands a `.md` to the browser as plain text — Markdown is a source format and
+nothing on that path renders it. `notes/render.py` converts them (stdlib only,
+no CDN, no `nbconvert`), and `wasm/build.sh` runs it so the rendering cannot
+drift from its source. Regenerate with `python3 notes/render.py`.
+
 The notebooks are committed with their outputs, so they read fine on GitHub
 without running anything. To run them:
 

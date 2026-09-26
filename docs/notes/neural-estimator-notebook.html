@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The neural estimator</title>
+<style>
+:root {
+  --ink: #23272e; --dim: #6b7280; --rule: #e3e6ea; --bg: #ffffff;
+  --code-bg: #f6f7f9; --accent: #2b5fa8; --out: #f9fafb; --guess: #6a4fb6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+h1, h2, h3, h4 { line-height: 1.25; margin: 2.2em 0 0.6em; font-weight: 650; }
+h1 { font-size: 1.9rem; margin-top: 0; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; padding-top: 0.6em; border-top: 1px solid var(--rule); }
+/* A rule immediately before a heading would draw the same line twice. */
+hr + h2 { border-top: 0; padding-top: 0; margin-top: 1.4em; }
+h3 { font-size: 1.1rem; }
+h4 { font-size: 1rem; color: var(--dim); }
+p, ul, ol, blockquote, table, pre { margin: 0 0 1.1em; }
+a { color: var(--accent); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.87em; background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 3px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 0.85em 1em; overflow-x: auto; line-height: 1.45;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+blockquote {
+  margin-left: 0; padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--accent); color: var(--ink);
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+th, td { text-align: left; padding: 0.45em 0.7em; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 650; border-bottom: 2px solid var(--rule); }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.2em 0; }
+li { margin: 0.25em 0; }
+em { color: inherit; }
+
+/* Notebook rendering */
+.cell { margin: 0 0 1.4em; }
+.cell.code { border-left: 3px solid var(--rule); padding-left: 0.9em; }
+.cell.code pre.src { background: #fbfcfd; }
+.cell .label {
+  font: 600 0.68rem/1 ui-monospace, monospace; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--dim); margin: 0.9em 0 0.4em;
+}
+pre.out {
+  background: var(--out); border-style: dashed; color: #333; font-size: 0.78rem;
+}
+.nav { font-size: 0.9rem; color: var(--dim); margin: 0 0 2.2em; }
+.nav a { margin-right: 1.1em; }
+footer {
+  margin-top: 3.5em; padding-top: 1.2em; border-top: 1px solid var(--rule);
+  font-size: 0.8rem; color: var(--dim);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #d9dde3; --dim: #8b93a1; --rule: #2c313a; --bg: #14171c;
+    --code-bg: #1b1f26; --accent: #7aa7e8; --out: #171b21; --guess: #a88fe0;
+  }
+  pre.out { color: #c3c9d2; }
+  .cell.code pre.src { background: #191d24; }
+}
+</style>
+</head>
+<body>
+<main>
+<nav class="nav"><a href="index.html">Notes</a><a href="constraint-estimator.html">Exact solver</a><a href="constraint-estimator-notebook.html">· notebook</a><a href="neural-estimator.html">Neural</a><a href="neural-estimator-notebook.html">· notebook</a><a href="../index.html">Play</a></nav>
+<div class="cell md"><h1 id="the-neural-estimator">The neural estimator</h1>
+<p>A small convolutional network that predicts P(mine) for <strong>one cell</strong> from a 9×9 window around it. It approximates a solver that is already exact, so the point is not accuracy — it is that inference costs the same however tangled the board is.</p>
+<p>This notebook loads the trained weights that ship in the repository, runs them, and measures them against the exact solver. Every number below is computed here.</p>
+<p>The prose version is <a href="neural-estimator.html"><code>neural-estimator.md</code></a>.</p>
+<p><strong>Requires numpy and nothing else</strong>, and the committed <code>neural/onnx/model.bin</code>.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>import random, statistics, sys, time
+sys.path.insert(0, &#x27;.&#x27;)
+sys.path.insert(0, &#x27;../neural&#x27;)
+import numpy as np
+import minesweeper_ref as ms
+
+net = ms.Network(&#x27;../neural/onnx/model.bin&#x27;)
+print(f&#x27;{net.parameters:,} parameters (BatchNorm already folded in)&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>121,665 parameters (BatchNorm already folded in)</code></pre></div>
+<div class="cell md"><h2 id="the-shape-of-it">The shape of it</h2>
+<p>Four 3×3 convolutions with BatchNorm and ReLU, an average pool down to 3×3, the global mines ratio appended back on, then 289 → 128 → 64 → 1 and a sigmoid.</p>
+<p>Two details that are not decoration:</p>
+<p><strong>The ratio is concatenated after the pooling.</strong> It arrives as channel 6, constant across the patch, so pooling preserves it — but only as one value diluted among 288. Appending it gives the head an undiluted copy. It is the only non-local thing in the input, and on a board where no number speaks it is the <em>only</em> signal there is.</p>
+<p><strong>The receptive field is the whole patch.</strong> Four padded 3×3 convolutions reach nine cells across. A mine constrains only its eight neighbours, and those neighbours&#x27; numbers all lie within four cells of the target — so the network can in principle see every constraint that bears on the cell, and nothing at all about the rest of the board except channel 6.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>reach = 1
+for i, (w, b) in enumerate(net.convs):
+    reach += 2
+    print(f&#x27;conv{i}  weight {str(w.shape):18} bias {str(b.shape):8} &#x27;
+          f&#x27;{w.size + b.size:&gt;7,} params   receptive field {reach}x{reach}&#x27;)
+print()
+for i, (w, b) in enumerate(net.linears):
+    print(f&#x27;fc{i}    weight {str(w.shape):18} bias {str(b.shape):8} {w.size + b.size:&gt;7,} params&#x27;)
+print()
+print(f&#x27;patch is 9x9, so the last convolution sees all of it&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>conv0  weight (32, 8, 3, 3)      bias (32,)      2,336 params   receptive field 3x3
+conv1  weight (64, 32, 3, 3)     bias (64,)     18,496 params   receptive field 5x5
+conv2  weight (64, 64, 3, 3)     bias (64,)     36,928 params   receptive field 7x7
+conv3  weight (32, 64, 3, 3)     bias (32,)     18,464 params   receptive field 9x9
+
+fc0    weight (128, 289)         bias (128,)    37,120 params
+fc1    weight (64, 128)          bias (64,)      8,256 params
+fc2    weight (1, 64)            bias (1,)          65 params
+
+patch is 9x9, so the last convolution sees all of it</code></pre></div>
+<div class="cell md"><h2 id="what-the-network-is-shown">What the network is shown</h2>
+<p>Eight channels over a 9×9 window centred on the cell in question.</p>
+<table><thead><tr><th>Ch</th><th>Value</th><th>Meaning</th></tr></thead><tbody><tr><td>0</td><td>number ÷ 8</td><td>what a visible cell shows</td></tr><tr><td>1</td><td>{0,1}</td><td>is visible</td></tr><tr><td>2</td><td>{0,1}</td><td>is hidden</td></tr><tr><td>3</td><td>{0,1}</td><td>is flagged</td></tr><tr><td>4</td><td>{0,1}</td><td>off the edge of the board</td></tr><tr><td>5</td><td>1 at (4,4)</td><td><em>this</em> is the cell being asked about</td></tr><tr><td>6</td><td>ratio</td><td>mines remaining ÷ cells still hidden, broadcast</td></tr><tr><td>7</td><td>{0,1}</td><td>unopened and touching a visible number</td></tr></tbody></table>
+<p>Two traps live in there, and neither raises an error — get one wrong and the model is simply fed an input it never saw:</p>
+<ul><li><strong>Channel 6&#x27;s denominator counts only <code>Hidden</code> cells, not flagged ones</strong>, and its numerator subtracts mines actually <em>uncovered</em>, not flags the player has placed. (The solver treats a flag as an unknown; the ratio treats it as spoken for. They are answering different questions.)</li><li><strong>Channel 7 needs a visible neighbour showing a number greater than zero.</strong> A visible <code>0</code> constrains nothing, so it does not make its neighbours border cells.</li></ul>
+<p>Both of those are mistakes I made writing <code>minesweeper_ref.py</code>, and both were caught only by the cross-check two cells further down.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>board = ms.from_text(&quot;&quot;&quot;
+...o**ooo
+...*..oo.
+......*oo
+.......oo
+*...*..oo
+....*...*
+&quot;&quot;&quot;)
+print(board.render())
+
+target = (5, 1)
+p = ms.patch(board, *target)
+names = [&#x27;number/8&#x27;, &#x27;visible&#x27;, &#x27;hidden&#x27;, &#x27;flagged&#x27;, &#x27;off-board&#x27;, &#x27;target&#x27;, &#x27;ratio&#x27;, &#x27;border&#x27;]
+print(f&#x27;\npatch for {target}, shape {p.shape}\n&#x27;)
+for c in (0, 1, 2, 5, 7):
+    print(f&#x27;channel {c}  {names[c]}&#x27;)
+    for row in p[c]:
+        print(&#x27;  &#x27; + &#x27;&#x27;.join((&#x27;.&#x27; if v == 0 else f&#x27;{v:g}&#x27;[:4]).rjust(5) for v in row))
+    print()
+print(f&#x27;channel 6  {names[6]} = {p[6][0][0]:.4f} everywhere&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>    ▒    ▒    ▒    2    ▒    ▒    1    ·    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    2    1    ▒
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    1
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    ▒    ▒
+
+patch for (5, 1), shape (8, 9, 9)
+
+channel 0  number/8
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    . 0.25    .    . 0.12    .    .    .
+      .    .    .    .    . 0.25 0.12    .    .
+      .    .    .    .    .    . 0.12    .    .
+      .    .    .    .    .    . 0.12    .    .
+      .    .    .    .    .    . 0.12 0.12    .
+      .    .    .    .    .    .    .    .    .
+
+channel 1  visible
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    1    .    .    1    1    1    .
+      .    .    .    .    .    1    1    .    .
+      .    .    .    .    .    .    1    1    .
+      .    .    .    .    .    .    1    1    .
+      .    .    .    .    .    .    1    1    .
+      .    .    .    .    .    .    .    .    .
+
+channel 2  hidden
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      1    1    .    1    1    .    .    .    .
+      1    1    1    1    1    .    .    1    .
+      1    1    1    1    1    1    .    .    .
+      1    1    1    1    1    1    .    .    .
+      1    1    1    1    1    1    .    .    .
+      1    1    1    1    1    1    1    1    .
+
+channel 5  target
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    1    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+
+channel 7  border
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    .    .    .    .    .    .    .    .
+      .    1    .    1    1    .    .    .    .
+      .    1    1    1    1    .    .    1    .
+      .    .    .    .    1    1    .    .    .
+      .    .    .    .    .    1    .    .    .
+      .    .    .    .    .    1    .    .    .
+      .    .    .    .    .    1    1    1    .
+
+channel 6  ratio = 0.1905 everywhere</code></pre></div>
+<div class="cell md"><h2 id="checking-the-patch-against-the-engine">Checking the patch against the engine</h2>
+<p>The patch layout is written down in three places — <code>probability/patch.rs</code>, <code>neural/dataset.py</code>, and <code>minesweeper_ref.py</code> — with nothing tying them together.</p>
+<p><code>rust_reference.txt</code> is the tie. It holds the probabilities the <strong>Rust engine</strong> produced for one fixed position; if the Python built a different patch, the numbers would not match. (They agree to float32 rounding, ~5e-7.)</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>fixture = ms.from_text(&quot;&quot;&quot;
+*.....
+..*...
+....*.
+...*..
+&quot;&quot;&quot;)
+# ...with the mine at (5,0) and the opened/flagged squares the fixture describes.
+fixture.mines = {(0, 0), (2, 1), (3, 3), (5, 0), (4, 2)}
+for cell in [(1, 1), (2, 2), (3, 1), (4, 1), (1, 2), (3, 2)]:
+    fixture.state[cell] = ms.VISIBLE
+fixture.state[(1, 0)] = ms.FLAGGED
+
+rust = {}
+for line in open(&#x27;rust_reference.txt&#x27;):
+    if line.startswith(&#x27;#&#x27;) or not line.strip():
+        continue
+    x, y, value = line.split()
+    rust[(int(x), int(y))] = float(value)
+
+worst = max(abs(net.predict(ms.patch(fixture, *c)) - rust[c]) for c in fixture.hidden_cells())
+print(f&#x27;compared {len(fixture.hidden_cells())} cells against the Rust engine&#x27;)
+print(f&#x27;worst disagreement: {worst:.2e}&#x27;)
+assert worst &lt; 1e-4, &#x27;the Python patch does not match the one the engine builds&#x27;</code></pre><p class="label">out</p><pre class="out"><code>compared 18 cells against the Rust engine
+worst disagreement: 5.02e-07</code></pre></div>
+<div class="cell md"><p>And the network itself against <code>patchcnn_reference.py</code> — the deliberately unoptimised numpy version that serves as the written specification. <code>Network</code> above is the same arithmetic vectorised, so it has to agree.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>from patchcnn_reference import forward
+
+cells = board.hidden_cells()[:6]
+worst = max(abs(net.predict(ms.patch(board, *c)) -
+                forward(&#x27;../neural/onnx/model.bin&#x27;, ms.patch(board, *c))) for c in cells)
+print(f&#x27;vectorised vs the reference implementation: {worst:.2e} over {len(cells)} cells&#x27;)
+
+t = time.time(); net.score_board(board); fast = time.time() - t
+t = time.time()
+for c in cells:
+    forward(&#x27;../neural/onnx/model.bin&#x27;, ms.patch(board, *c))
+slow = (time.time() - t) / len(cells) * len(board.hidden_cells())
+print(f&#x27;whole board: {fast:.3f}s vectorised, ~{slow:.1f}s with the reference &#x27;
+      f&#x27;(which re-reads the weights every call)&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>vectorised vs the reference implementation: 2.68e-07 over 6 cells
+whole board: 0.084s vectorised, ~7.0s with the reference (which re-reads the weights every call)</code></pre></div>
+<div class="cell md"><h2 id="side-by-side-with-the-exact-solver">Side by side with the exact solver</h2>
+<p>The same board, scored both ways. This is what the web front-end shows: the proof in one corner of each cell, the guess in the other.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>exact = ms.exact_probabilities(board)
+guess = net.score_board(board)
+
+print(&#x27;exact (constraint search)&#x27;)
+print(board.render(exact))
+print()
+print(&#x27;network&#x27;)
+print(board.render(guess))
+print()
+gap = {c: abs(exact[c] - guess[c]) for c in exact}
+print(f&#x27;mean |network - exact| = {statistics.mean(gap.values()):.3f}, &#x27;
+      f&#x27;worst {max(gap.values()):.3f} at {max(gap, key=gap.get)}&#x27;)
+print(f&#x27;the network\&#x27;s numbers sum to {sum(guess.values()):.1f}; there are &#x27;
+      f&#x27;{board.mines_count} mines — nothing constrains it to be calibrated that way&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>exact (constraint search)
+  11%  11%  40%    2  40%  50%    1    ·    ·
+  11%  11%  40%  40%  40%  50%    2    1   0%
+  11%  11%  11%  11%  11%   0% 100%    1    ·
+  11%  11%  11%  11%  11%  11%   0%    1    ·
+  11%  11%  11%  11%  11%  11%   0%    1    1
+  11%  11%  11%  11%  11%  11%   0%  50%  50%
+
+network
+  17%  19%  41%    2  32%  78%    1    ·    ·
+  18%  18%  38%  39%  29%  94%    2    1   2%
+  17%  16%  15%  14%  17%   1% 100%    1    ·
+  17%  17%  15%  16%  16%  15%   0%    1    ·
+  18%  18%  17%  15%  17%  14%   0%    1    1
+  18%  18%  16%  15%  17%  15%   0%  35%  32%
+
+mean |network - exact| = 0.066, worst 0.443 at (5, 1)
+the network&#x27;s numbers sum to 9.7; there are 8 mines — nothing constrains it to be calibrated that way</code></pre></div>
+<div class="cell md"><p>The last line is worth pausing on. The solver&#x27;s numbers <em>must</em> sum to the mine count — it is counting layouts of exactly that many mines. The network has no such constraint: it scores each cell independently and nothing ties the total to anything. That it lands close is a property it learned, not one it is given.</p></div>
+<div class="cell md"><h2 id="how-good-is-it-measured-here">How good is it, measured here</h2>
+<p>The number that matters is not the mean error. It is what the network says about cells the solver has <strong>proved</strong>, because those are the ones auto-play would act on:</p>
+<ul><li>a proven-safe cell the network scores high is a wasted move;</li><li>a proven-mine cell the network scores low is a <strong>lost game</strong>.</li></ul>
+<p>Both sweeps below generate real positions, solve them exactly, and compare. (A minute or so; the exact solver here enumerates outright, so positions with a very large group are skipped rather than waited for.)</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>def sweep(width, height, mines, seed, want, budget, max_group=16):
+    random.seed(seed)
+    safe, mine, positions = [], [], 0
+    started = time.time()
+    while positions &lt; want and time.time() - started &lt; budget:
+        squares = [(x, y) for y in range(height) for x in range(width)]
+        laid = set(random.sample(squares, mines))
+        b = ms.Board(width, height, laid)
+        b.reveal(*random.choice([c for c in squares if c not in laid]))
+
+        hidden, constraints, to_place = ms.build_constraints(b)
+        proven_mines, proven_safe, reduced, _ = ms.propagate(len(hidden), constraints, to_place)
+        decided = set(proven_mines) | set(proven_safe)
+        free = [i for i in range(len(hidden)) if i not in decided]
+        remap = {c: i for i, c in enumerate(free)}
+        groups = ms.decompose([([remap[c] for c in cs], r) for cs, r in reduced], len(free))
+        if groups and max(len(cells) for cells, _ in groups) &gt; max_group:
+            continue          # would take longer to enumerate than it is worth
+
+        exact = ms.exact_probabilities(b)
+        if not exact:
+            continue
+        scored = net.score_board(b)
+        counted = False
+        for cell, p in exact.items():
+            if p == 0.0:
+                safe.append(scored[cell]); counted = True
+            elif p == 1.0:
+                mine.append(scored[cell]); counted = True
+        positions += counted
+    return positions, safe, mine, time.time() - started
+
+share = lambda values, test: 100 * sum(1 for v in values if test(v)) / max(len(values), 1)
+
+for width, height, mines, label in [(9, 9, 10, &#x27;beginner&#x27;), (16, 16, 40, &#x27;intermediate&#x27;)]:
+    n, safe, mine, elapsed = sweep(width, height, mines, 7, want=40, budget=45)
+    print(f&#x27;{label}  {width}x{height}/{mines}  —  {n} positions, {elapsed:.0f}s&#x27;)
+    print(f&#x27;   solver says SAFE ({len(safe):4d} cells): network median {statistics.median(safe):.3f}, &#x27;
+          f&#x27;{share(safe, lambda v: v &lt; 0.05):4.1f}% under 5%, worst call {max(safe):.3f}&#x27;)
+    print(f&#x27;   solver says MINE ({len(mine):4d} cells): network median {statistics.median(mine):.3f}, &#x27;
+          f&#x27;{share(mine, lambda v: v &gt; 0.95):4.1f}% over 95%, worst call {min(mine):.3f}&#x27;)
+    print()</code></pre><p class="label">out</p><pre class="out"><code>beginner  9x9/10  —  40 positions, 14s
+   solver says SAFE ( 275 cells): network median 0.000, 89.8% under 5%, worst call 0.558
+   solver says MINE ( 213 cells): network median 1.000, 94.8% over 95%, worst call 0.403
+
+intermediate  16x16/40  —  18 positions, 45s
+   solver says SAFE ( 207 cells): network median 0.000, 84.1% under 5%, worst call 0.588
+   solver says MINE ( 134 cells): network median 1.000, 90.3% over 95%, worst call 0.184</code></pre></div>
+<div class="cell md"><p>Two things to read off that.</p>
+<p><strong>It is well calibrated in the middle and wrong at the edges.</strong> The medians are essentially 0 and 1 — on a typical proved cell the network agrees completely. The <em>worst</em> calls are the story: a proven-safe cell scored above 0.5, a proven-mine cell scored under 0.25. Those are rare and they are catastrophic, which is why the exact solver stays authoritative and the guess never feeds auto-reveal.</p>
+<p><strong>It degrades with density.</strong> The held-out test split gives 0.143% of proven mines called under 10%. Mid-game Expert positions measured while building the web front-end were far worse: only 76.5% of proven-safe cells under 5%, against ~90% here. It is a <em>local</em> approximation, and a dense board needs more than local information.</p></div>
+<div class="cell md"><h2 id="correction-during-play">Correction during play</h2>
+<p>Every exact solve is a perfectly labelled position that cost nothing extra to produce. So the web front-end steps the network&#x27;s <strong>output layer</strong> towards the solver&#x27;s answers after each solve.</p>
+<p>Only the last layer. With a sigmoid output and cross-entropy loss the gradient into the head&#x27;s weights is just <code>(prediction − target) × feature</code> — no chain rule left to apply — which is a dozen lines of Rust rather than an autograd engine in the browser.</p>
+<p>And the forward pass it needs is the same one <code>predict</code> does, which is why the page folds correction into the scoring pass instead of running a second one. Done separately over a whole board it measured <strong>4.2 s on 40×40, on every move</strong>.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>fresh = ms.Network(&#x27;../neural/onnx/model.bin&#x27;)
+targets = ms.exact_probabilities(board)
+cells = list(targets)
+
+def mean_gap(network):
+    return statistics.mean(abs(network.predict(ms.patch(board, *c)) - targets[c]) for c in cells)
+
+print(f&#x27;before      : mean |network - exact| = {mean_gap(fresh):.4f}&#x27;)
+for step in range(1, 4):
+    for c in cells:
+        fresh.learn(ms.patch(board, *c), targets[c], rate=0.02)   # the rate the page uses
+    print(f&#x27;after {step} pass{&quot;es&quot; if step &gt; 1 else &quot;  &quot;}: mean |network - exact| = {mean_gap(fresh):.4f}&#x27;)
+
+print()
+print(&#x27;this position, corrected&#x27;)
+print(board.render({c: fresh.predict(ms.patch(board, *c)) for c in cells}))</code></pre><p class="label">out</p><pre class="out"><code>before      : mean |network - exact| = 0.0657
+after 1 pass  : mean |network - exact| = 0.0522
+after 2 passes: mean |network - exact| = 0.0503
+after 3 passes: mean |network - exact| = 0.0501
+
+this position, corrected
+  14%  16%  36%    2  29%  69%    1    ·    ·
+  15%  15%  34%  34%  26%  90%    2    1   2%
+  14%  13%  12%  11%  14%   1% 100%    1    ·
+  14%  14%  12%  13%  13%  12%   0%    1    ·
+  15%  15%  14%  12%  13%  11%   0%    1    1
+  15%  15%  13%  12%  14%  12%   0%  28%  26%</code></pre></div>
+<div class="cell md"><h3 id="the-rate-is-not-a-free-parameter">The rate is not a free parameter</h3>
+<p>Because only the head moves, the update is <code>w -= rate * error * features</code>, and the shift it produces in the logit is <code>rate * error * |features|²</code>. Those features are post-ReLU activations of a 64-wide layer, so <code>|features|²</code> is around 120 — which means a rate that looks small is not.</p>
+<p>At 0.5 the correction destroys the model in one pass. The page uses <strong>0.02</strong>.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>print(f&#x27;|features|^2 for one cell: {float(fresh.features(ms.patch(board, *cells[0])) @ fresh.features(ms.patch(board, *cells[0]))):.0f}&#x27;)
+print()
+print(f&quot;{&#x27;rate&#x27;:&gt;8}  {&#x27;before&#x27;:&gt;8}  {&#x27;1 pass&#x27;:&gt;8}  {&#x27;2&#x27;:&gt;8}  {&#x27;3&#x27;:&gt;8}&quot;)
+for rate in (0.5, 0.1, 0.02, 0.005, 0.001):
+    net_r = ms.Network(&#x27;../neural/onnx/model.bin&#x27;)
+    before = statistics.mean(abs(net_r.predict(ms.patch(board, *c)) - targets[c]) for c in cells)
+    after = []
+    for _ in range(3):
+        for c in cells:
+            net_r.learn(ms.patch(board, *c), targets[c], rate)
+        after.append(statistics.mean(abs(net_r.predict(ms.patch(board, *c)) - targets[c]) for c in cells))
+    marks = &#x27;  &#x27;.join(f&#x27;{v:8.4f}&#x27; for v in after)
+    note = &#x27;   &lt;- the page&#x27; if rate == 0.02 else (&#x27;   &lt;- destroys it&#x27; if rate == 0.5 else &#x27;&#x27;)
+    print(f&#x27;{rate:&gt;8}  {before:8.4f}  {marks}{note}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>|features|^2 for one cell: 123
+
+    rate    before    1 pass         2         3
+     0.5    0.0657    0.5010    0.6368    0.6081   &lt;- destroys it
+     0.1    0.0657    0.0937    0.0958    0.0935
+    0.02    0.0657    0.0522    0.0503    0.0501   &lt;- the page
+   0.005    0.0657    0.0580    0.0536    0.0509
+   0.001    0.0657    0.0637    0.0618    0.0603</code></pre></div>
+<div class="cell md"><h3 id="does-it-damage-the-boards-it-is-not-looking-at">Does it damage the boards it is <em>not</em> looking at?</h3>
+<p>A sequence of single-position updates is the classic recipe for catastrophic forgetting, so this is worth checking rather than assuming. Correct on four boards in turn and watch the error on four others the network never sees.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>random.seed(3)
+
+def sample_position(width, height, mines, max_group=14):
+    while True:
+        squares = [(x, y) for y in range(height) for x in range(width)]
+        laid = set(random.sample(squares, mines))
+        b = ms.Board(width, height, laid)
+        b.reveal(*random.choice([c for c in squares if c not in laid]))
+        hidden, constraints, to_place = ms.build_constraints(b)
+        pm, ps, reduced, _ = ms.propagate(len(hidden), constraints, to_place)
+        decided = set(pm) | set(ps)
+        free = [i for i in range(len(hidden)) if i not in decided]
+        remap = {c: i for i, c in enumerate(free)}
+        groups = ms.decompose([([remap[c] for c in cs], r) for cs, r in reduced], len(free))
+        if groups and max(len(cs) for cs, _ in groups) &gt; max_group:
+            continue
+        exact = ms.exact_probabilities(b)
+        if exact:
+            return b, exact
+
+positions = [sample_position(9, 9, 10) for _ in range(8)]
+train, held_out = positions[:4], positions[4:]
+
+def gap(network, b, exact):
+    return statistics.mean(abs(network.predict(ms.patch(b, *c)) - exact[c]) for c in exact)
+
+net_c = ms.Network(&#x27;../neural/onnx/model.bin&#x27;)
+print(f&#x27;held-out error before any correction : &#x27;
+      f&#x27;{statistics.mean(gap(net_c, b, e) for b, e in held_out):.4f}&#x27;)
+for i, (b, exact) in enumerate(train):
+    for c in exact:
+        net_c.learn(ms.patch(b, *c), exact[c], 0.02)
+    print(f&#x27;  after correcting on board {i}: this board {gap(net_c, b, exact):.4f}   &#x27;
+          f&#x27;held-out {statistics.mean(gap(net_c, hb, he) for hb, he in held_out):.4f}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>held-out error before any correction : 0.0160
+  after correcting on board 0: this board 0.0045   held-out 0.0144
+  after correcting on board 1: this board 0.0067   held-out 0.0097
+  after correcting on board 2: this board 0.0099   held-out 0.0108
+  after correcting on board 3: this board 0.0053   held-out 0.0122</code></pre></div>
+<div class="cell md"><p>It generalises rather than overfitting: the boards it never saw improve too. That is the case for doing it at all — and the reason to keep the rate where it is.</p>
+<p>Note the page does one pass per position at 0.02, which is a nudge, not training.</p></div>
+<div class="cell md"><p>Two gates on that, in the page, both for a reason:</p>
+<ul><li><strong>Only after an exact solve.</strong> A sampled estimate carries noise, and a network taught from noise learns the noise.</li><li><strong>Only in the display modes where the solver is visible.</strong> Under <em>neural network only</em> the page runs uncorrected, because a network being corrected by the solver mid-run is not the thing that mode is there to measure.</li></ul>
+<p>Note also that the step above overfits this one position — press it far enough and the network gets very good at this board and worse everywhere else. In the page the rate is 0.02 and each position is seen once, which is a nudge, not training.</p></div>
+<div class="cell md"><h2 id="training">Training</h2>
+<p><code>datagen</code> (Rust) plays real games and labels them with the exact constraint solver. Configurations are sampled uniformly from 9×9/10, 10×10/15, 16×16/40, 16×16/51 and 30×16/99, and each game is played a random number of moves before being labelled, so positions come from every stage rather than only the end.</p>
+<p>Two deliberate choices:</p>
+<ul><li><strong>A position the solver cannot finish within budget is skipped, not sampled.</strong> In the output a sampled label is indistinguishable from an exact one, so letting one through would quietly teach the model somebody&#x27;s guesses.</li><li><strong>Labels are probabilities, not mine/no-mine.</strong> A cell the solver puts at 0.4 should be predicted 0.4, not rounded to &quot;safe&quot;.</li></ul>
+<p><strong>60 000 positions → 6 485 906 training cells</strong>, 757 394 validation, ~380 000 test.</p>
+<table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Loss</td><td><code>BCE + 0.1 · MSE</code></td></tr><tr><td>Optimiser</td><td>AdamW, lr 1e-3, weight decay 1e-4, cosine annealing</td></tr><tr><td>Batch</td><td>2048</td></tr><tr><td>Augmentation</td><td>D4 — 4 rotations × 2 flips; labels are symmetry-invariant</td></tr><tr><td>Epochs</td><td>10, on CPU</td></tr></tbody></table>
+<p>BCE gives calibration: it punishes a confident wrong answer far harder than a hedged one, which for a probability is exactly right. The MSE term is small and only discourages being wrong by a lot.</p>
+<pre><code>Epoch   1/10  train_loss=0.4868  val_bce=0.4906  val_mae=0.0800
+Epoch   2/10  train_loss=0.4586  val_bce=0.4474  val_mae=0.0477
+Epoch   3/10  train_loss=0.4414  val_bce=0.4324  val_mae=0.0356
+Epoch   4/10  train_loss=0.4328  val_bce=0.4274  val_mae=0.0293
+Epoch   5/10  train_loss=0.4300  val_bce=0.4260  val_mae=0.0296
+Epoch   6/10  train_loss=0.4280  val_bce=0.4257  val_mae=0.0348
+Epoch   7/10  train_loss=0.4269  val_bce=0.4241  val_mae=0.0300
+Epoch   8/10  train_loss=0.4261  val_bce=0.4243  val_mae=0.0334
+Epoch   9/10  train_loss=0.4256  val_bce=0.4229  val_mae=0.0274   &lt;- best
+Epoch  10/10  train_loss=0.4253  val_bce=0.4231  val_mae=0.0298</code></pre>
+<p><strong>This is a first run, not a tuned one.</strong> The curve was still drifting down when cosine annealing took the learning rate to zero. Ten epochs was what fit; it is the most obvious thing to improve, and the 0.143% is the number to watch while doing it.</p>
+<p><code>neural/README.md</code> records the four separate reasons this would not train before — an 11.5 GB dataset representation, training data that was all endgames, a Rust feature that did not compile, and a missing <code>onnxscript</code>. None of them the model.</p></div>
+<div class="cell md"><h2 id="two-implementations-on-purpose">Two implementations, on purpose</h2>
+<p><code>model.onnx</code> is read by <code>tract</code> in the desktop build. <code>model.bin</code> is the same weights with BatchNorm folded into the preceding convolution, read by <code>probability::patch_cnn</code> — the forward pass written out by hand in Rust.</p>
+<p>The hand-written one exists for two reasons. <strong>Size</strong>: <code>tract</code> costs 13.4 MB in the WebAssembly build against a 174 KB baseline. <strong>And the gradient</strong>: owning the arithmetic means owning the derivative, which is what makes the correction above possible in the browser.</p>
+<p>At inference BatchNorm is an affine map with fixed parameters, so it folds away:</p>
+<pre><code>scale = gamma / sqrt(var + eps)
+W&#x27;    = W * scale
+b&#x27;    = (b - mean) * scale + beta</code></pre>
+<p>That is the difference between 122 049 trainable parameters and the 121 665 in the file — the 384 BatchNorm scale and shift values are gone, absorbed.</p>
+<p>Three implementations therefore have to agree, so <code>export_weights.py</code> writes <code>model.vectors</code>: patches with the outputs PyTorch gave for them, letting the Rust test verify itself with no Python present. The notebook can read it too.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>raw = open(&#x27;../neural/onnx/model.vectors&#x27;, &#x27;rb&#x27;).read()
+assert raw[:8] == b&#x27;MSPCNNV1&#x27;
+count = int(np.frombuffer(raw[8:12], dtype=&#x27;&lt;u4&#x27;)[0])
+values = np.frombuffer(raw, dtype=&#x27;&lt;f4&#x27;, offset=12).reshape(count, 8 * 9 * 9 + 1)
+
+worst = max(abs(net.predict(row[:-1].reshape(8, 9, 9)) - row[-1]) for row in values)
+print(f&#x27;{count} patches with the outputs PyTorch gave for them&#x27;)
+print(f&#x27;worst disagreement with PyTorch: {worst:.2e}&#x27;)
+assert worst &lt; 1e-4</code></pre><p class="label">out</p><pre class="out"><code>24 patches with the outputs PyTorch gave for them
+worst disagreement with PyTorch: 1.97e-06</code></pre></div>
+<div class="cell md"><p>So four readings of this network now agree, to float32 rounding: PyTorch (through the recorded vectors), <code>patchcnn_reference.py</code>, the Rust that ships, and the code in this notebook.</p></div>
+<div class="cell md"><h2 id="where-this-lives">Where this lives</h2>
+<table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody><tr><td>The model</td><td><code>neural/model.py</code></td></tr><tr><td>Patch layout</td><td><code>minesweeper_core/src/probability/patch.rs</code>, <code>neural/dataset.py</code></td></tr><tr><td>Data generation</td><td><code>datagen/src/main.rs</code>, <code>neural/datagen.py</code></td></tr><tr><td>Training</td><td><code>neural/train.py</code>, <code>neural/prepare.py</code></td></tr><tr><td>Export</td><td><code>neural/export.py</code>, <code>neural/export_weights.py</code></td></tr><tr><td>The numpy specification</td><td><code>neural/patchcnn_reference.py</code></td></tr><tr><td>Rust inference and the gradient step</td><td><code>minesweeper_core/src/probability/patch_cnn.rs</code></td></tr><tr><td>Tests</td><td><code>minesweeper_core/tests/patch_cnn.rs</code>, <code>tests/neural.rs</code></td></tr></tbody></table>
+<p>The solver it is approximating is described in <a href="constraint-estimator.html"><code>constraint-estimator.md</code></a> and <a href="constraint-estimator-notebook.html"><code>constraint-estimator.ipynb</code></a>.</p></div>
+<footer>Generated from the repository by <code>notes/render.py</code> · source 15d05131</footer>
+</main>
+</body>
+</html>

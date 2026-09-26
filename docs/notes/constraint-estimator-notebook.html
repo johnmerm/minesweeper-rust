@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the exact probabilities are computed</title>
+<style>
+:root {
+  --ink: #23272e; --dim: #6b7280; --rule: #e3e6ea; --bg: #ffffff;
+  --code-bg: #f6f7f9; --accent: #2b5fa8; --out: #f9fafb; --guess: #6a4fb6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+h1, h2, h3, h4 { line-height: 1.25; margin: 2.2em 0 0.6em; font-weight: 650; }
+h1 { font-size: 1.9rem; margin-top: 0; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; padding-top: 0.6em; border-top: 1px solid var(--rule); }
+/* A rule immediately before a heading would draw the same line twice. */
+hr + h2 { border-top: 0; padding-top: 0; margin-top: 1.4em; }
+h3 { font-size: 1.1rem; }
+h4 { font-size: 1rem; color: var(--dim); }
+p, ul, ol, blockquote, table, pre { margin: 0 0 1.1em; }
+a { color: var(--accent); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.87em; background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 3px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 0.85em 1em; overflow-x: auto; line-height: 1.45;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+blockquote {
+  margin-left: 0; padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--accent); color: var(--ink);
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+th, td { text-align: left; padding: 0.45em 0.7em; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 650; border-bottom: 2px solid var(--rule); }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.2em 0; }
+li { margin: 0.25em 0; }
+em { color: inherit; }
+
+/* Notebook rendering */
+.cell { margin: 0 0 1.4em; }
+.cell.code { border-left: 3px solid var(--rule); padding-left: 0.9em; }
+.cell.code pre.src { background: #fbfcfd; }
+.cell .label {
+  font: 600 0.68rem/1 ui-monospace, monospace; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--dim); margin: 0.9em 0 0.4em;
+}
+pre.out {
+  background: var(--out); border-style: dashed; color: #333; font-size: 0.78rem;
+}
+.nav { font-size: 0.9rem; color: var(--dim); margin: 0 0 2.2em; }
+.nav a { margin-right: 1.1em; }
+footer {
+  margin-top: 3.5em; padding-top: 1.2em; border-top: 1px solid var(--rule);
+  font-size: 0.8rem; color: var(--dim);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #d9dde3; --dim: #8b93a1; --rule: #2c313a; --bg: #14171c;
+    --code-bg: #1b1f26; --accent: #7aa7e8; --out: #171b21; --guess: #a88fe0;
+  }
+  pre.out { color: #c3c9d2; }
+  .cell.code pre.src { background: #191d24; }
+}
+</style>
+</head>
+<body>
+<main>
+<nav class="nav"><a href="index.html">Notes</a><a href="constraint-estimator.html">Exact solver</a><a href="constraint-estimator-notebook.html">· notebook</a><a href="neural-estimator.html">Neural</a><a href="neural-estimator-notebook.html">· notebook</a><a href="../index.html">Play</a></nav>
+<div class="cell md"><h1 id="how-the-exact-probabilities-are-computed">How the exact probabilities are computed</h1>
+<p>Every unopened cell carries a number: the fraction of consistent mine layouts in which it holds a mine. That is a definition, not an estimate — count the layouts, count the ones with a mine there, divide.</p>
+<p>The difficulty is that on an Expert board there are about $10^{82}$ ways to place the mines. This notebook walks the pipeline that makes the count tractable, running each stage on real positions, and finishes by checking the whole thing against brute force.</p>
+<p>The prose version is <a href="constraint-estimator.html"><code>constraint-estimator.md</code></a>. The engine itself is Rust, in <code>minesweeper_core/src/probability/</code>; <code>minesweeper_ref.py</code> beside this notebook is a readable Python twin that follows it step for step.</p>
+<p><strong>Requires numpy and nothing else.</strong></p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>import itertools, math, random, sys
+sys.path.insert(0, &#x27;.&#x27;)
+import minesweeper_ref as ms
+
+print(&#x27;reference module loaded&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>reference module loaded</code></pre></div>
+<div class="cell md"><h2 id="a-position-to-work-on">A position to work on</h2>
+<p><code>from_text</code> builds a board from a picture of it. <code>*</code> is a mine, <code>.</code> an unopened empty square, a digit or space an opened one. The numbers shown are <em>computed</em> from the mine positions, so the picture cannot contradict itself.</p>
+<p>Below, <code>▒</code> is unopened and <code>·</code> is an opened zero. The mines are of course invisible to the solver — we only know where they are because we are writing the example.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code># `*` is a mine, `.` an unopened empty square, `o` an opened one. The numbers
+# are computed from the mine positions, so the picture cannot contradict itself.
+board = ms.from_text(&quot;&quot;&quot;
+...o**ooo
+...*..oo.
+......*oo
+.......oo
+*...*..oo
+....*...*
+&quot;&quot;&quot;)
+
+print(board.render())
+print()
+print(f&#x27;{len(board.hidden_cells())} unopened cells, {board.mines_count} mines&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>    ▒    ▒    ▒    2    ▒    ▒    1    ·    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    2    1    ▒
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    ·
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    1    1
+    ▒    ▒    ▒    ▒    ▒    ▒    ▒    ▒    ▒
+
+42 unopened cells, 8 mines</code></pre></div>
+<div class="cell md"><h2 id="1-constraints">1. Constraints</h2>
+<p>Each visible number becomes <em>&quot;exactly k of these unopened neighbours are mines&quot;</em>. Plus one global constraint: the board holds a fixed number of mines in total.</p>
+<p>A flagged cell stays in as an unknown — a flag is the player&#x27;s opinion, and the solver has no reason to believe it. A visible <code>0</code> is a constraint too: &quot;none of my neighbours is a mine&quot; is as strong a statement as any other number.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>hidden, constraints, mines_to_place = ms.build_constraints(board)
+
+print(f&#x27;{len(hidden)} unknowns, {len(constraints)} constraints, {mines_to_place} mines to place&#x27;)
+print()
+for cells, required in constraints[:8]:
+    squares = &#x27; &#x27;.join(str(hidden[i]) for i in cells)
+    print(f&#x27;exactly {required} mine(s) among: {squares}&#x27;)
+if len(constraints) &gt; 8:
+    print(f&#x27;... and {len(constraints) - 8} more&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>42 unknowns, 11 constraints, 8 mines to place
+
+exactly 2 mine(s) among: (2, 0) (4, 0) (2, 1) (3, 1) (4, 1)
+exactly 1 mine(s) among: (5, 0) (5, 1)
+exactly 0 mine(s) among: (8, 1)
+exactly 0 mine(s) among: (8, 1)
+exactly 2 mine(s) among: (5, 0) (5, 1) (5, 2) (6, 2)
+exactly 1 mine(s) among: (8, 1) (6, 2)
+exactly 1 mine(s) among: (8, 1) (6, 2) (6, 3)
+exactly 0 mine(s) among: (8, 1)
+... and 3 more</code></pre></div>
+<div class="cell md"><h2 id="2-propagation-what-local-rules-alone-settle">2. Propagation — what local rules alone settle</h2>
+<p>Two rules, applied until nothing changes:</p>
+<ul><li>a constraint whose mines are all accounted for makes its remaining cells <strong>safe</strong>;</li><li>a constraint with exactly as many undecided cells as mines left makes them all <strong>mines</strong>.</li></ul>
+<p>The board&#x27;s total mine count is the same pair of rules applied globally.</p>
+<p>This costs no search. It is <strong>sound but incomplete</strong> — it never marks a cell wrongly, but it misses cells only a full enumeration can prove. A caller must never read <em>&quot;not proven&quot;</em> as <em>&quot;not certain&quot;</em>. <code>probability::certain_cells</code> exposes exactly this, and auto-play iterates on it, paying for a full solve only once it runs dry.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>proven_mines, proven_safe, reduced, mines_left = ms.propagate(
+    len(hidden), constraints, mines_to_place)
+
+print(f&#x27;proven mines : {[hidden[i] for i in proven_mines]}&#x27;)
+print(f&#x27;proven safe  : {[hidden[i] for i in proven_safe]}&#x27;)
+print(f&#x27;still open   : {len(hidden) - len(proven_mines) - len(proven_safe)} cells, &#x27;
+      f&#x27;{mines_left} mines, {len(reduced)} constraints left&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>proven mines : [(6, 2)]
+proven safe  : [(8, 1), (6, 3), (6, 4)]
+still open   : 38 cells, 7 mines, 5 constraints left</code></pre></div>
+<div class="cell md"><h2 id="3-decomposition-the-stage-that-matters">3. Decomposition — the stage that matters</h2>
+<p>Two cells are related only if some number counts them both, directly or through a chain of other cells. So the border falls into groups that share no cell at all. Union-find over <em>&quot;appears in the same constraint&quot;</em> finds them.</p>
+<p>The groups are independent <strong>apart from the board&#x27;s total mine count</strong>. That is the whole trick, and it turns a product into a sum:</p>
+<pre><code>one problem:     solutions(A) × solutions(B) × solutions(C)
+three problems:  solutions(A) + solutions(B) + solutions(C)</code></pre></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>decided = set(proven_mines) | set(proven_safe)
+free = [i for i in range(len(hidden)) if i not in decided]
+remap = {c: i for i, c in enumerate(free)}
+reduced_local = [([remap[c] for c in cs], r) for cs, r in reduced]
+
+components = ms.decompose(reduced_local, len(free))
+in_a_component = {c for cells, _ in components for c in cells}
+interior = [i for i in range(len(free)) if i not in in_a_component]
+
+print(f&#x27;{len(components)} independent groups, plus {len(interior)} interior cells&#x27;)
+for n, (cells, cons) in enumerate(components):
+    squares = &#x27; &#x27;.join(str(hidden[free[c]]) for c in cells)
+    print(f&#x27;  group {n}: {len(cells)} cells, {len(cons)} constraints  →  {squares}&#x27;)
+
+product = math.prod(2 ** len(cells) for cells, _ in components)
+total = sum(2 ** len(cells) for cells, _ in components)
+print()
+print(f&#x27;as one problem : {product:,} assignments to walk&#x27;)
+print(f&#x27;group by group : {total:,}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>3 independent groups, plus 27 interior cells
+  group 0: 5 cells, 1 constraints  →  (2, 0) (4, 0) (2, 1) (3, 1) (4, 1)
+  group 1: 3 cells, 2 constraints  →  (5, 0) (5, 1) (5, 2)
+  group 2: 3 cells, 2 constraints  →  (6, 5) (7, 5) (8, 5)
+
+as one problem : 2,048 assignments to walk
+group by group : 48</code></pre></div>
+<div class="cell md"><h2 id="4-what-a-group-returns-and-why-it-is-not-a-probability">4. What a group returns — and why it is not a probability</h2>
+<p>How likely a group&#x27;s layouts are depends on how many mines the <em>rest</em> of the board takes. So a probability is not a property of the group.</p>
+<p>What <em>is</em> a property of the group — independent of the total mine count and of every other group — is the count of layouts per mine count:</p>
+<ul><li><code>ways[k]</code> — layouts of this group using exactly <code>k</code> mines</li><li><code>cell_ways[c][k]</code> — how many of those have cell <code>c</code> as a mine</li></ul>
+<p>This form is why groups can be combined at all. It is also why they can be <strong>cached across moves</strong>: the solution is a function of exactly the group&#x27;s squares and the numbers around them, so an entry can never go stale — a board that changes a group changes its cache key too. Measured reuse after one reveal: 97% of groups on 50×50/150.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>solutions = [ms.solve_component(cells, cons) for cells, cons in components]
+
+for n, ((cells, _), (ways, cell_ways)) in enumerate(zip(components, solutions)):
+    print(f&#x27;group {n}:  ways[k] = {ways}   ({sum(ways)} layouts in total)&#x27;)
+    for local, cell in enumerate(cells):
+        print(f&#x27;    {str(hidden[free[cell]]):8} is a mine in {cell_ways[local]}&#x27;)
+    print()</code></pre><p class="label">out</p><pre class="out"><code>group 0:  ways[k] = [0, 0, 10, 0, 0, 0]   (10 layouts in total)
+    (2, 0)   is a mine in [0, 0, 4, 0, 0, 0]
+    (4, 0)   is a mine in [0, 0, 4, 0, 0, 0]
+    (2, 1)   is a mine in [0, 0, 4, 0, 0, 0]
+    (3, 1)   is a mine in [0, 0, 4, 0, 0, 0]
+    (4, 1)   is a mine in [0, 0, 4, 0, 0, 0]
+
+group 1:  ways[k] = [0, 2, 0, 0]   (2 layouts in total)
+    (5, 0)   is a mine in [0, 1, 0, 0]
+    (5, 1)   is a mine in [0, 1, 0, 0]
+    (5, 2)   is a mine in [0, 0, 0, 0]
+
+group 2:  ways[k] = [0, 2, 0, 0]   (2 layouts in total)
+    (6, 5)   is a mine in [0, 0, 0, 0]
+    (7, 5)   is a mine in [0, 1, 0, 0]
+    (8, 5)   is a mine in [0, 1, 0, 0]</code></pre></div>
+<div class="cell md"><h2 id="5-combining">5. Combining</h2>
+<p>The number of whole-board layouts using <code>b</code> border mines is the convolution of the groups&#x27; <code>ways</code>. The <strong>interior</strong> — cells no number speaks about — takes whatever is left, in <code>C(interior, left)</code> ways.</p>
+<p>For each group the code needs <em>everything except this group</em>. It gets that from a prefix and a suffix convolution, <code>prefix[j] × suffix[j+1]</code>, rather than by dividing the total out — division breaks wherever a group contributes a zero.</p>
+<p>Every interior cell gets the same number as every other, since nothing distinguishes them.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>probs = ms.exact_probabilities(board)
+
+print(board.render(probs))
+print()
+print(f&#x27;these sum to {sum(probs.values()):.6f}; there are {board.mines_count} mines&#x27;)
+print()
+still_hidden = sorted(c for c in board.mines if c in probs)
+print(&#x27;where the mines really are: &#x27; + &#x27;, &#x27;.join(f&#x27;{c}={probs[c]:.0%}&#x27; for c in still_hidden))</code></pre><p class="label">out</p><pre class="out"><code>  11%  11%  40%    2  40%  50%    1    ·    ·
+  11%  11%  40%  40%  40%  50%    2    1   0%
+  11%  11%  11%  11%  11%   0% 100%    1    ·
+  11%  11%  11%  11%  11%  11%   0%    1    ·
+  11%  11%  11%  11%  11%  11%   0%    1    1
+  11%  11%  11%  11%  11%  11%   0%  50%  50%
+
+these sum to 8.000000; there are 8 mines
+
+where the mines really are: (0, 4)=11%, (3, 1)=40%, (4, 0)=40%, (4, 4)=11%, (4, 5)=11%, (5, 0)=50%, (6, 2)=100%, (8, 5)=50%</code></pre></div>
+<div class="cell md"><p>The sum is the cheapest sanity check there is, and it catches a mis-scaled weight table, a wrong interior window and an off-by-one in the prefix/suffix chain alike. The Rust asserts it on every solve in debug builds.</p></div>
+<div class="cell md"><h2 id="6-checking-it-against-brute-force">6. Checking it against brute force</h2>
+<p>The pipeline is only worth having if it agrees with counting every layout directly. Brute force is hopeless past about 20 unopened cells — which is the whole reason the pipeline exists — but that is enough to test on.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>random.seed(11)
+worst, checked = 0.0, 0
+
+for _ in range(400):
+    w, h = random.choice([(5, 4), (6, 4), (5, 5), (6, 5)])
+    squares = [(x, y) for y in range(h) for x in range(w)]
+    mines = set(random.sample(squares, random.randint(3, 7)))
+    b = ms.Board(w, h, mines)
+    b.reveal(*random.choice([c for c in squares if c not in mines]))
+    if not 1 &lt;= len(b.hidden_cells()) &lt;= 20:
+        continue
+    oracle = ms.brute_force(b)
+    if not oracle:
+        continue
+    exact = ms.exact_probabilities(b)
+    checked += 1
+    worst = max(worst, max(abs(exact[c] - oracle[c]) for c in oracle))
+
+print(f&#x27;{checked} random positions, worst disagreement {worst:.2e}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>181 random positions, worst disagreement 0.00e+00</code></pre></div>
+<div class="cell md"><h2 id="7-the-first-trap-rescaled-weights">7. The first trap: rescaled weights</h2>
+<p><code>C(n, k)</code> overflows <code>f64</code> on any real board, so the weights are computed in log space and rescaled by subtracting a peak. The scale cancels because the <em>same table</em> divides numerator and denominator — which is also why you must <strong>never compare weights across two tables</strong>.</p>
+<p>The first version subtracted the table&#x27;s <strong>global</strong> peak. On a sparse board the reachable range of <code>k</code> is far out in the tail, so everything underflowed to zero, the total came out zero, and the whole grid read <strong>0%</strong> — which every front-end treats as proof that a cell is safe, and opens. A 30-game sweep caught it as two detonations on 50×50/150.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>import numpy as np
+
+n, k_min, k_max = 2500, 140, 150          # interior cells, reachable mines
+ln_fact = np.cumsum([0.0] + [math.log(i) for i in range(1, n + 1)])
+ln_w = np.array([ln_fact[n] - ln_fact[k] - ln_fact[n - k] for k in range(n + 1)])
+
+print(f&#x27;C({n}, {k_max}) as a float      : {math.exp(ln_w[k_max]):.3g}  (f64 max is {sys.float_info.max:.3g})&#x27;)
+print()
+global_peak = ln_w.max()                   # the bug
+reachable_peak = ln_w[k_min:k_max + 1].max()  # the fix
+print(f&#x27;global peak    : ln = {global_peak:8.1f}  at k = {int(ln_w.argmax())}&#x27;)
+print(f&#x27;reachable peak : ln = {reachable_peak:8.1f}  over k = {k_min}..{k_max}&#x27;)
+print()
+for k in (k_min, k_max):
+    print(f&#x27;  k={k}:  scaled by global peak    = {math.exp(ln_w[k] - global_peak):.3g}&#x27;)
+    print(f&#x27;         scaled by reachable peak = {math.exp(ln_w[k] - reachable_peak):.3g}&#x27;)
+
+bad = np.exp(ln_w[k_min:k_max + 1] - global_peak)
+print()
+print(f&#x27;total weight with the global peak    : {bad.sum():.3g}   &lt;- every cell reads 0%&#x27;)
+print(f&#x27;total weight with the reachable peak : {np.exp(ln_w[k_min:k_max+1] - reachable_peak).sum():.3g}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>C(2500, 150) as a float      : 8.97e+244  (f64 max is 1.8e+308)
+
+global peak    : ln =   1728.7  at k = 1250
+reachable peak : ln =    564.0  over k = 140..150
+
+  k=140:  scaled by global peak    = 0
+         scaled by reachable peak = 8.07e-13
+  k=150:  scaled by global peak    = 0
+         scaled by reachable peak = 1
+
+total weight with the global peak    : 0   &lt;- every cell reads 0%
+total weight with the reachable peak : 1.07</code></pre></div>
+<div class="cell md"><h2 id="8-the-second-trap-a-partial-search-is-not-a-small-answer">8. The second trap: a partial search is not a small answer</h2>
+<p>If a group exhausts its node budget, <strong>the whole answer is discarded</strong> — not just that group&#x27;s.</p>
+<p>A depth-first walk that stops early has covered a lexicographic <em>prefix</em> of the search space. A cell whose subtree was never reached is a mine in zero of the layouts seen, which reads as 0%, which every caller treats as proof. A truncated walk does not give a rough answer; it gives a confident wrong one.</p>
+<p>Below: enumerate one group honestly, then stop a quarter of the way in and compare.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code>cells, cons = max(components, key=lambda c: len(c[0]))
+size = len(cells)
+
+def enumerate_group(limit=None):
+    ways, cell_ways, seen = [0] * (size + 1), [[0] * (size + 1) for _ in range(size)], 0
+    for bits in itertools.product((0, 1), repeat=size):   # lexicographic, as DFS is
+        if limit is not None and seen &gt;= limit:
+            break
+        seen += 1
+        if any(sum(bits[i] for i in cs) != r for cs, r in cons):
+            continue
+        ways[sum(bits)] += 1
+        for c, bit in enumerate(bits):
+            if bit:
+                cell_ways[c][sum(bits)] += 1
+    return ways, cell_ways
+
+full_ways, full_cell = enumerate_group()
+part_ways, part_cell = enumerate_group(limit=2 ** size // 4)
+
+print(f&#x27;group of {size} cells, {2 ** size} assignments; the partial walk sees the first quarter&#x27;)
+print()
+print(f&quot;{&#x27;cell&#x27;:&gt;10}  {&#x27;honest&#x27;:&gt;8}  {&#x27;truncated&#x27;:&gt;10}&quot;)
+for local, cell in enumerate(cells):
+    honest = sum(full_cell[local]) / max(sum(full_ways), 1)
+    part = sum(part_cell[local]) / max(sum(part_ways), 1)
+    flag = &#x27;   &lt;- reads as PROVEN SAFE&#x27; if part == 0 and honest &gt; 0 else &#x27;&#x27;
+    print(f&#x27;{str(hidden[free[cell]]):&gt;10}  {honest:8.1%}  {part:10.1%}{flag}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>group of 5 cells, 32 assignments; the partial walk sees the first quarter
+
+      cell    honest   truncated
+    (2, 0)     40.0%        0.0%   &lt;- reads as PROVEN SAFE
+    (4, 0)     40.0%        0.0%   &lt;- reads as PROVEN SAFE
+    (2, 1)     40.0%       66.7%
+    (3, 1)     40.0%       66.7%
+    (4, 1)     40.0%       66.7%</code></pre></div>
+<div class="cell md"><h3 id="the-invariant-that-follows">The invariant that follows</h3>
+<blockquote><p><strong>Never treat 0.0 or 1.0 as merely a small or large number.</strong></p></blockquote>
+<p>The solver decides those two values from <strong>integer layout counts</strong>, never from the computed ratio:</p>
+<pre><code>let never_a_mine = cell_ways.iter().all(|&amp;ways| ways == 0.0);
+let always_a_mine = cell_ways.iter().zip(&amp;solution.ways)
+    .all(|(&amp;mine, &amp;total)| mine == total);</code></pre>
+<p>A rescaled weight can underflow; a count cannot lie that way. Everything else is clamped strictly inside <code>(0, 1)</code>, so no arithmetic accident can manufacture a proof.</p>
+<p>And a <strong>sampled</strong> 0% means only that no draw happened to put a mine there. Monte Carlo is the fallback for when the exact search gives up, and nothing ever auto-opens on its numbers.</p></div>
+<div class="cell code"><p class="label">in</p><pre class="src"><code># The guard, in the Python twin: certainty is read off the integer counts,
+# never off the ratio. Note that the search proves cells propagation missed.
+for n, ((cells, _), (ways, cell_ways)) in enumerate(zip(components, solutions)):
+    for local, cell in enumerate(cells):
+        never = all(w == 0 for w in cell_ways[local])
+        always = all(m == t for m, t in zip(cell_ways[local], ways))
+        verdict = &#x27;PROVEN SAFE&#x27; if never else &#x27;PROVEN MINE&#x27; if always else &#x27;uncertain&#x27;
+        print(f&#x27;group {n}  {str(hidden[free[cell]]):&gt;8}  {verdict}&#x27;)</code></pre><p class="label">out</p><pre class="out"><code>group 0    (2, 0)  uncertain
+group 0    (4, 0)  uncertain
+group 0    (2, 1)  uncertain
+group 0    (3, 1)  uncertain
+group 0    (4, 1)  uncertain
+group 1    (5, 0)  uncertain
+group 1    (5, 1)  uncertain
+group 1    (5, 2)  PROVEN SAFE
+group 2    (6, 5)  PROVEN SAFE
+group 2    (7, 5)  uncertain
+group 2    (8, 5)  uncertain</code></pre></div>
+<div class="cell md"><h2 id="where-this-lives">Where this lives</h2>
+<table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody><tr><td>Constraints, propagation, Monte Carlo</td><td><code>minesweeper_core/src/probability/monte_carlo.rs</code></td></tr><tr><td>Decomposition, combination, caching</td><td><code>minesweeper_core/src/probability/components.rs</code></td></tr><tr><td>The depth-first search and its budget</td><td><code>minesweeper_core/src/probability/constraint_search.rs</code></td></tr><tr><td><code>certain_cells</code></td><td><code>minesweeper_core/src/probability/mod.rs</code></td></tr><tr><td>Tests, including a brute-force oracle</td><td><code>minesweeper_core/tests/probability.rs</code></td></tr></tbody></table>
+<p>Bounds, as shipped: the search visits at most 1 000 000 nodes (checked at <em>every</em> node, because a deep subtree that never reaches a leaf produces no leaves to count), past which it reports nothing and the caller falls back to sampling. Worst measured solve is about 12 ms on boards up to 200 a side, against 137 seconds before decomposition.</p></div>
+<footer>Generated from the repository by <code>notes/render.py</code> · source 12d3efcc</footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes</title>
+<style>
+:root {
+  --ink: #23272e; --dim: #6b7280; --rule: #e3e6ea; --bg: #ffffff;
+  --code-bg: #f6f7f9; --accent: #2b5fa8; --out: #f9fafb; --guess: #6a4fb6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+h1, h2, h3, h4 { line-height: 1.25; margin: 2.2em 0 0.6em; font-weight: 650; }
+h1 { font-size: 1.9rem; margin-top: 0; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; padding-top: 0.6em; border-top: 1px solid var(--rule); }
+/* A rule immediately before a heading would draw the same line twice. */
+hr + h2 { border-top: 0; padding-top: 0; margin-top: 1.4em; }
+h3 { font-size: 1.1rem; }
+h4 { font-size: 1rem; color: var(--dim); }
+p, ul, ol, blockquote, table, pre { margin: 0 0 1.1em; }
+a { color: var(--accent); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.87em; background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 3px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 0.85em 1em; overflow-x: auto; line-height: 1.45;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+blockquote {
+  margin-left: 0; padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--accent); color: var(--ink);
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+th, td { text-align: left; padding: 0.45em 0.7em; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 650; border-bottom: 2px solid var(--rule); }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.2em 0; }
+li { margin: 0.25em 0; }
+em { color: inherit; }
+
+/* Notebook rendering */
+.cell { margin: 0 0 1.4em; }
+.cell.code { border-left: 3px solid var(--rule); padding-left: 0.9em; }
+.cell.code pre.src { background: #fbfcfd; }
+.cell .label {
+  font: 600 0.68rem/1 ui-monospace, monospace; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--dim); margin: 0.9em 0 0.4em;
+}
+pre.out {
+  background: var(--out); border-style: dashed; color: #333; font-size: 0.78rem;
+}
+.nav { font-size: 0.9rem; color: var(--dim); margin: 0 0 2.2em; }
+.nav a { margin-right: 1.1em; }
+footer {
+  margin-top: 3.5em; padding-top: 1.2em; border-top: 1px solid var(--rule);
+  font-size: 0.8rem; color: var(--dim);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #d9dde3; --dim: #8b93a1; --rule: #2c313a; --bg: #14171c;
+    --code-bg: #1b1f26; --accent: #7aa7e8; --out: #171b21; --guess: #a88fe0;
+  }
+  pre.out { color: #c3c9d2; }
+  .cell.code pre.src { background: #191d24; }
+}
+</style>
+</head>
+<body>
+<main>
+<nav class="nav"><a href="index.html">Notes</a><a href="constraint-estimator.html">Exact solver</a><a href="constraint-estimator-notebook.html">· notebook</a><a href="neural-estimator.html">Neural</a><a href="neural-estimator-notebook.html">· notebook</a><a href="../index.html">Play</a></nav>
+<h1 id="notes">Notes</h1>
+<p>Two write-ups of how this project decides what a cell is worth, each as prose and as a notebook that runs what it describes.</p>
+<table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td><a href="constraint-estimator.html"><code>constraint-estimator.md</code></a> · <a href="constraint-estimator-notebook.html"><code>.ipynb</code></a></td><td>The exact solver: constraints, propagation, independent regions, and the two traps that made it silently wrong</td></tr><tr><td><a href="neural-estimator.html"><code>neural-estimator.md</code></a> · <a href="neural-estimator-notebook.html"><code>.ipynb</code></a></td><td>The CNN: architecture, how it was trained, how good it is, and the correction it gets during play</td></tr></tbody></table>
+<p>Both are also served as rendered HTML from <code>docs/notes/</code>, because raw.githack hands a <code>.md</code> to the browser as plain text — Markdown is a source format and nothing on that path renders it. <code>notes/render.py</code> converts them (stdlib only, no CDN, no <code>nbconvert</code>), and <code>wasm/build.sh</code> runs it so the rendering cannot drift from its source. Regenerate with <code>python3 notes/render.py</code>.</p>
+<p>The notebooks are committed with their outputs, so they read fine on GitHub without running anything. To run them:</p>
+<pre><code>pip install numpy          # that is the whole dependency list
+jupyter lab notes/         # or: python -m nbconvert --to notebook --execute --inplace notes/*.ipynb</code></pre>
+<p>Both import <code>minesweeper_ref.py</code>, a readable Python twin of the Rust engine. It is not the engine — <code>minesweeper_core</code> is — but it follows the same steps, and the notebooks check it three ways: the solver against a brute-force oracle, the patch layout against <code>rust_reference.txt</code> (probabilities the real engine produced for a fixed position), and the network against <code>neural/onnx/model.vectors</code> (the outputs PyTorch itself gave).</p>
+<p><code>rust_reference.txt</code> is regenerated by the snippet in <code>neural-estimator.md</code> under <em>Checking the patch against the engine</em>.</p>
+<footer>Generated from the repository by <code>notes/render.py</code> · source 58ba39af</footer>
+</main>
+</body>
+</html>

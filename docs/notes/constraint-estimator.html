@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How the exact probabilities are computed</title>
+<style>
+:root {
+  --ink: #23272e; --dim: #6b7280; --rule: #e3e6ea; --bg: #ffffff;
+  --code-bg: #f6f7f9; --accent: #2b5fa8; --out: #f9fafb; --guess: #6a4fb6;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 46rem; margin: 0 auto; padding: 2.5rem 1.25rem 5rem; }
+h1, h2, h3, h4 { line-height: 1.25; margin: 2.2em 0 0.6em; font-weight: 650; }
+h1 { font-size: 1.9rem; margin-top: 0; letter-spacing: -0.01em; }
+h2 { font-size: 1.35rem; padding-top: 0.6em; border-top: 1px solid var(--rule); }
+/* A rule immediately before a heading would draw the same line twice. */
+hr + h2 { border-top: 0; padding-top: 0; margin-top: 1.4em; }
+h3 { font-size: 1.1rem; }
+h4 { font-size: 1rem; color: var(--dim); }
+p, ul, ol, blockquote, table, pre { margin: 0 0 1.1em; }
+a { color: var(--accent); }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.87em; background: var(--code-bg); padding: 0.12em 0.35em; border-radius: 3px;
+}
+pre {
+  background: var(--code-bg); border: 1px solid var(--rule); border-radius: 6px;
+  padding: 0.85em 1em; overflow-x: auto; line-height: 1.45;
+}
+pre code { background: none; padding: 0; font-size: 0.82rem; }
+blockquote {
+  margin-left: 0; padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--accent); color: var(--ink);
+}
+table { border-collapse: collapse; width: 100%; font-size: 0.93rem; }
+th, td { text-align: left; padding: 0.45em 0.7em; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 650; border-bottom: 2px solid var(--rule); }
+hr { border: 0; border-top: 1px solid var(--rule); margin: 2.2em 0; }
+li { margin: 0.25em 0; }
+em { color: inherit; }
+
+/* Notebook rendering */
+.cell { margin: 0 0 1.4em; }
+.cell.code { border-left: 3px solid var(--rule); padding-left: 0.9em; }
+.cell.code pre.src { background: #fbfcfd; }
+.cell .label {
+  font: 600 0.68rem/1 ui-monospace, monospace; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--dim); margin: 0.9em 0 0.4em;
+}
+pre.out {
+  background: var(--out); border-style: dashed; color: #333; font-size: 0.78rem;
+}
+.nav { font-size: 0.9rem; color: var(--dim); margin: 0 0 2.2em; }
+.nav a { margin-right: 1.1em; }
+footer {
+  margin-top: 3.5em; padding-top: 1.2em; border-top: 1px solid var(--rule);
+  font-size: 0.8rem; color: var(--dim);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #d9dde3; --dim: #8b93a1; --rule: #2c313a; --bg: #14171c;
+    --code-bg: #1b1f26; --accent: #7aa7e8; --out: #171b21; --guess: #a88fe0;
+  }
+  pre.out { color: #c3c9d2; }
+  .cell.code pre.src { background: #191d24; }
+}
+</style>
+</head>
+<body>
+<main>
+<nav class="nav"><a href="index.html">Notes</a><a href="constraint-estimator.html">Exact solver</a><a href="constraint-estimator-notebook.html">· notebook</a><a href="neural-estimator.html">Neural</a><a href="neural-estimator-notebook.html">· notebook</a><a href="../index.html">Play</a></nav>
+<h1 id="how-the-exact-probabilities-are-computed">How the exact probabilities are computed</h1>
+<p><em>Companion notebook: <a href="constraint-estimator-notebook.html"><code>constraint-estimator.ipynb</code></a> — runs every step below on real positions and checks the answers against brute force.</em></p>
+<p>Every unopened cell on the board carries a number: the fraction of consistent mine layouts in which that cell holds a mine. It is a definition, not an estimate — count the layouts, count the ones with a mine there, divide. The whole of <code>minesweeper_core::probability</code> exists because that count is astronomically large and the division has to happen anyway.</p>
+<p>This note is about how it is made tractable, and about the two places where being clever nearly broke it.</p>
+<hr>
+<h2 id="the-problem">The problem</h2>
+<p>On a 30×16 Expert board after a few moves there might be 300 unopened cells and 99 mines. The number of ways to place them is C(300, 99) ≈ 10⁸². The consistent ones — those where every visible number sees exactly as many mines as it says — are far fewer, but still far too many to enumerate.</p>
+<p>What saves it is that the constraints are <strong>local and sparse</strong>. A visible <code>3</code> says something about at most eight cells. Most pairs of cells are related by no constraint at all.</p>
+<hr>
+<h2 id="the-pipeline">The pipeline</h2>
+<p>Four stages, in <code>probability/</code>:</p>
+<pre><code>board
+  │
+  ├─ SimSetup::build ──────► hidden cells, one constraint per visible number
+  │
+  ├─ propagate ───────────► the cells local rules alone settle  (cheap, incomplete)
+  │
+  ├─ components::decompose ► independent groups  (this is the important one)
+  │
+  ├─ ConstraintSearch ─────► per group: ways[k], cell_ways[c][k]
+  │
+  └─ components::combine ──► convolve the groups, fold in the interior, divide</code></pre>
+<h3 id="1-constraints">1. Constraints</h3>
+<p>Each visible number becomes <em>&quot;exactly k of these unopened neighbours are mines&quot;</em>. Plus one global constraint: the whole board holds a fixed number of mines.</p>
+<p>A flagged cell stays in the constraints as an unknown. A flag is the player&#x27;s opinion; the solver has no reason to believe it. (It is excluded from the <em>neural</em> estimator&#x27;s global ratio for a different reason — see the other note.)</p>
+<p>A visible <code>0</code> is a constraint too. A cascade normally leaves zeros with no hidden neighbours, but a board restored from a snapshot carries no such guarantee, so the code does not rely on it.</p>
+<h3 id="2-propagation">2. Propagation</h3>
+<p>Two rules, applied until nothing changes:</p>
+<ul><li>a constraint whose mines are all accounted for makes its remaining cells <strong>safe</strong>;</li><li>a constraint with exactly as many undecided cells as mines left makes them all <strong>mines</strong>.</li></ul>
+<p>The global mine count is the same pair of rules applied to the whole board.</p>
+<p>This costs no search and settles most of a typical position. It is <strong>sound but incomplete</strong>: it never marks a cell wrongly, but it misses cells only a full enumeration can prove. A caller must never read <em>&quot;not proven&quot;</em> as <em>&quot;not certain&quot;</em>. <code>probability::certain_cells</code> exposes exactly this, and auto-play iterates on it, paying for a full solve only once it runs dry — re-solving after every pass is what once made a single click take 31 seconds.</p>
+<h3 id="3-decomposition-the-one-that-matters">3. Decomposition — the one that matters</h3>
+<p>Two cells are related only if some number counts them both, directly or through a chain. So the border falls into groups that share no cell. Union-find over <em>&quot;appears in the same constraint&quot;</em> finds them.</p>
+<p>The groups are independent <strong>apart from the board&#x27;s total mine count</strong>. That is the whole trick, and it turns a product into a sum:</p>
+<pre><code>one problem:     solutions(A) × solutions(B) × solutions(C)
+three problems:  solutions(A) + solutions(B) + solutions(C)</code></pre>
+<p>A 50×50 board with 150 mines splits into roughly 27 groups per move. This one change took the worst measured click from <strong>137 seconds to about 12 milliseconds</strong>.</p>
+<h3 id="4-what-a-group-returns">4. What a group returns</h3>
+<p>Not a probability. How likely a group&#x27;s layouts are depends on how many mines the <em>rest</em> of the board takes, so a probability is not a property of the group.</p>
+<p>What is a property of the group — independent of the total mine count and of every other group — is the count of layouts per mine count:</p>
+<ul><li><code>ways[k]</code> — layouts of this group using exactly <code>k</code> mines</li><li><code>cell_ways[c][k]</code> — how many of those have cell <code>c</code> as a mine</li></ul>
+<p>This form is why groups can be combined at all. It is also why they can be <strong>cached across moves</strong>: a group&#x27;s solution is a function of exactly its squares and the numbers around them, so the cache key is those, and an entry can never go stale — a board that changes a group changes its key too. Measured reuse after a single reveal: 97% of groups on 50×50/150, 86% on 50×50/300.</p>
+<p>The key is built from <strong>board coordinates</strong>, deliberately. Hidden-cell indices are renumbered on every move as cells open, so a key built from them would miss every time — or worse, collide between different squares.</p>
+<h3 id="5-combining">5. Combining</h3>
+<p>The number of whole-board layouts using <code>b</code> border mines is the convolution of the groups&#x27; <code>ways</code>. The <strong>interior</strong> — cells no number speaks about — takes whatever mines are left, in <code>C(interior, left)</code> ways.</p>
+<p>For each group the code needs <em>&quot;everything except this group&quot;</em>. It gets it from a prefix and a suffix convolution, <code>prefix[j] × suffix[j+1]</code>, rather than by dividing the total. Division breaks wherever a group contributes a zero.</p>
+<p>Every interior cell has the same probability as every other, since nothing distinguishes them.</p>
+<hr>
+<h2 id="the-two-traps">The two traps</h2>
+<p>Both of these were live bugs. Both produced <em>wrong answers that looked fine</em>.</p>
+<h3 id="scaled-binomials">Scaled binomials</h3>
+<p><code>C(n, k)</code> overflows <code>f64</code> on any real board, so the weights are computed in log space and rescaled by subtracting a peak. The scale factor cancels because the same table divides numerator and denominator — <strong>never compare weights across two tables.</strong></p>
+<p>The first version normalised by the table&#x27;s <em>global</em> peak. On a sparse board the reachable range of <code>k</code> sits far out in the tail, so <code>exp(566 - 1663)</code> underflowed to zero, every weight became zero, and the whole grid read <strong>0%</strong>. Every front-end reads 0% as proof a cell is safe and opens it. A 30-game sweep caught it as two detonations on 50×50/150.</p>
+<p>The fix: take the peak over the <em>reachable</em> <code>k</code> range only, plus two guards — a zero total weight reports no result at all, and auto-play acts only on results from the exact search.</p>
+<h3 id="a-partial-search-is-not-a-small-answer">A partial search is not a small answer</h3>
+<p>If a group exhausts its node budget, <strong>the entire answer is discarded</strong> — not just that group&#x27;s.</p>
+<p>A depth-first walk that stops early has covered a lexicographic prefix of the search space. A cell whose subtree was never visited reads zero mines out of the layouts seen, which is 0%, which every caller treats as proof. A partial walk does not give you a rough answer; it gives you a confident wrong one.</p>
+<h3 id="the-invariant-that-follows">The invariant that follows</h3>
+<blockquote><p><strong>Never treat 0.0 or 1.0 as merely a small or large number.</strong></p></blockquote>
+<p>The solver decides those two values from <strong>integer layout counts</strong>, never from the computed ratio:</p>
+<pre><code>let never_a_mine = cell_ways.iter().all(|&amp;ways| ways == 0.0);
+let always_a_mine = cell_ways.iter().zip(&amp;solution.ways)
+    .all(|(&amp;mine, &amp;total)| mine == total);</code></pre>
+<p>A rescaled weight can underflow; a count cannot lie that way. Everything else is clamped strictly inside <code>(0, 1)</code> so no arithmetic accident can manufacture a proof.</p>
+<p>A <strong>sampled</strong> 0% means only that no draw happened to put a mine there. The Monte Carlo estimator is a fallback for when the exact search gives up, and nothing ever auto-opens on its numbers.</p>
+<hr>
+<h2 id="bounds">Bounds</h2>
+<table><thead><tr><th></th><th></th></tr></thead><tbody><tr><td>Node budget</td><td><code>ConstraintSearch::max_nodes</code>, default 1 000 000, checked at every node</td></tr><tr><td>Past it</td><td>reports no result; caller falls back to Monte Carlo</td></tr><tr><td>Monte Carlo</td><td>bounded too, and bails after <code>max_attempts / 10</code> with zero valid samples</td></tr><tr><td>Offline</td><td><code>ConstraintSearch::exhaustive()</code> removes the bound</td></tr><tr><td>Worst measured solve</td><td>~12 ms, boards up to 200 a side</td></tr></tbody></table>
+<p>The budget is checked at every node rather than every *n*th valid leaf, because a deep subtree that never reaches a leaf produces no leaves to count — which is exactly the subtree that runs away.</p>
+<hr>
+<h2 id="what-is-left">What is left</h2>
+<p>Decomposition cannot help when a single group is too large to enumerate. The next step there is a dynamic program over the search frontier: merge partial assignments that agree on the cells still in play and on how many mines they have used, instead of walking each to a leaf. That is polynomial where the border is thin, which it usually is, and it would subsume decomposition rather than replace it — disconnected groups are just frontiers that never meet.</p>
+<p>Whatever replaces it must keep the same two guarantees: <strong>bounded work</strong>, and <strong>no 0.0 or 1.0 that is not proven</strong>.</p>
+<hr>
+<h2 id="source">Source</h2>
+<table><thead><tr><th>What</th><th>Where</th></tr></thead><tbody><tr><td>Constraints, propagation, Monte Carlo</td><td><code>minesweeper_core/src/probability/monte_carlo.rs</code></td></tr><tr><td>Decomposition, combination, caching</td><td><code>minesweeper_core/src/probability/components.rs</code></td></tr><tr><td>The depth-first search and its budget</td><td><code>minesweeper_core/src/probability/constraint_search.rs</code></td></tr><tr><td><code>certain_cells</code></td><td><code>minesweeper_core/src/probability/mod.rs</code></td></tr><tr><td>Tests, including a brute-force oracle</td><td><code>minesweeper_core/tests/probability.rs</code></td></tr><tr><td>The Python twin used by the notebook</td><td><code>notes/minesweeper_ref.py</code></td></tr></tbody></table>
+<footer>Generated from the repository by <code>notes/render.py</code> · source d32be0f8</footer>
+</main>
+</body>
+</html>

@@ -22,5 +22,9 @@ cp "$artifact" "$out/minesweeper.wasm"
 # from a file:// URL, where fetching the .wasm would be blocked.
 python3 "$root/wasm/bundle.py" "$out"
 
+# The notes are served from docs/ too, and a stale rendering of them drifts from
+# its source exactly the way a stale .wasm drifts from the engine.
+python3 "$root/notes/render.py" > /dev/null
+
 printf 'wrote %s (%s bytes)\n' "$out/minesweeper.wasm" "$(wc -c < "$out/minesweeper.wasm")"
 printf 'wrote %s (%s bytes)\n' "$out/standalone.html" "$(wc -c < "$out/standalone.html")"

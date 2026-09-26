@@ -37,8 +37,8 @@ BatchNorm is folded away. Source: `neural/model.py`.
 
 Two details that are not decoration:
 
-**The global ratio is appended after the pooling.** Mines-remaining ÷ cells-still-
-hidden arrives as channel 6, constant across the patch — and average pooling over
+**The global ratio is appended after the pooling.** Mines remaining over cells
+still hidden arrives as channel 6, constant across the patch — and average pooling over
 a constant is that constant, so it would survive, but only as one value diluted
 among 288. Concatenating it back gives the head an undiluted copy. It is the only
 thing in the input that is not local, and on a board where no number speaks it is
