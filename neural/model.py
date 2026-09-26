@@ -3,7 +3,8 @@
 Input:  (B, 8, 9, 9)  — 8-channel 9×9 patch centred on the target hidden cell
 Output: (B,)           — P(mine) in [0, 1]
 
-Architecture (~180k parameters):
+Architecture (122,049 trainable parameters; 121,665 once the exporter folds
+BatchNorm into the convolutions — see export_weights.py):
   4× Conv2d(→32/64, 3×3, pad=1) + BN + ReLU
   AdaptiveAvgPool2d(3×3)  → flatten 288-d
   Append mines_remaining_ratio (channel 6 centre value)

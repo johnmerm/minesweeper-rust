@@ -11,8 +11,14 @@ minesweeper/
 ├── gui/                # Desktop GUI (Qt / qmetaobject QML)
 ├── web/                # Web server (Actix-Web + Tera templates)
 ├── wasm/               # WebAssembly bindings (C ABI, no wasm-bindgen)
-└── docs/               # Static HTML/JS site that loads the .wasm
+├── docs/               # Static HTML/JS site that loads the .wasm
+└── notes/              # Write-ups of the two estimators, prose + runnable notebooks
 ```
+
+`notes/` explains both estimators in depth, with notebooks that run what they
+describe against the committed weights and check themselves against a
+brute-force oracle, the Rust engine and PyTorch's own outputs. Read those before
+changing `probability/` or the training pipeline.
 
 ### `minesweeper_core`
 

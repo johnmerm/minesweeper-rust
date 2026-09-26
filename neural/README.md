@@ -1,5 +1,7 @@
 # Neural mine-probability estimator
 
+*In depth, with a runnable notebook: [`../notes/neural-estimator.md`](../notes/neural-estimator.md).*
+
 A small CNN that predicts P(mine) for one cell from a 9x9 patch around it,
 trained on exact labels from the constraint solver. It is an approximation of a
 solver that is already exact — the point is speed, not accuracy: inference is a
