@@ -162,7 +162,28 @@
 
 <!-- Both lines are rewritten by wasm/bundle.py with a hash of the built files, so
      a cached copy of an old script can never be paired with a new page. -->
-<script>var MINESWEEPER_BUILD = "0c682840";</script>
-<script src="minesweeper.js?v=0c682840"></script>
+<script>var MINESWEEPER_BUILD = "d34ae2ff";</script>
+<script src="minesweeper.js?v=d34ae2ff"></script>
+
+<!-- The page and the script are separate URLs with separate cache entries, so a
+     browser or a CDN can pair two generations of them. The fresh half has to be
+     the one that notices: a stale script does not know it is stale, and the
+     failure it produces points at whichever control moved, not at the cache. -->
+<script>
+(function () {
+  var page = typeof MINESWEEPER_BUILD === 'string' ? MINESWEEPER_BUILD : 'dev';
+  var script = typeof MINESWEEPER_SCRIPT_BUILD === 'string' ? MINESWEEPER_SCRIPT_BUILD : 'missing';
+  if (page === 'dev' || script === page) return;
+  // Its own element, not #error: the stale script owns that one and will
+  // overwrite it with whatever it failed on a moment later.
+  var box = document.createElement('div');
+  box.style.cssText = 'margin:8px auto;max-width:44rem;padding:10px 14px;border-radius:6px;' +
+    'background:#fdecea;color:#7f231c;border:1px solid #f5c6c2;font-size:14px;text-align:left';
+  box.textContent = 'This page is build ' + page + ' but the script it loaded is ' + script +
+    ' \u2014 something between here and the repository is mixing two generations. ' +
+    'A hard reload (Ctrl/Cmd-Shift-R) fixes it; until then the board may not work at all.';
+  document.body.insertBefore(box, document.body.firstChild);
+})();
+</script>
 </body>
 </html>

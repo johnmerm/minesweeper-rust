@@ -30,9 +30,24 @@ js = (docs / "minesweeper.js").read_text(encoding="utf-8")
 wasm_bytes = (docs / "minesweeper.wasm").read_bytes()
 wasm_b64 = base64.b64encode(wasm_bytes).decode("ascii")
 
+# The id is hashed over the script with its own stamp blanked out, so stamping
+# it cannot change it. Without that the hash would chase its own tail.
+SCRIPT_STAMP = re.compile(r"(var MINESWEEPER_SCRIPT_BUILD = ')[^']*(';)")
+
+unstamped = SCRIPT_STAMP.sub(r"\1\2", js)
+if unstamped == js and "MINESWEEPER_SCRIPT_BUILD" not in js:
+    raise SystemExit(
+        "minesweeper.js no longer declares MINESWEEPER_SCRIPT_BUILD; update bundle.py"
+    )
+
 # The network's weights are inside the .wasm, so a retrained model changes that
 # file and the id with it — nothing extra to hash.
-build = hashlib.sha256(js.encode("utf-8") + wasm_bytes).hexdigest()[:8]
+build = hashlib.sha256(unstamped.encode("utf-8") + wasm_bytes).hexdigest()[:8]
+
+# Stamp the script, so it can say which build it is and the page can notice when
+# the two disagree. They are separate URLs with separate cache entries.
+js = SCRIPT_STAMP.sub(rf"\g<1>{build}\g<2>", unstamped)
+(docs / "minesweeper.js").write_text(js, encoding="utf-8")
 
 # Rewrite rather than append, so re-running over an already-stamped file replaces
 # the previous id instead of accumulating query strings.

@@ -10,6 +10,19 @@
  *   - standalone.html defines MINESWEEPER_WASM_BASE64 first, so it also works
  *                     from a file:// URL with no network at all
  */
+/**
+ * Which build this *script* is, stamped by wasm/bundle.py.
+ *
+ * Global, and outside the closure, on purpose: index.html carries the same id
+ * and checks it against this one. They are separate files a host can serve from
+ * different generations, and when that happens the page half-works or dies on a
+ * control the other half removed — a symptom that points nowhere near the cause.
+ *
+ * The check lives in the page rather than here, because the stale half cannot be
+ * relied on to notice anything and the page is the half that arrived fresh.
+ */
+var MINESWEEPER_SCRIPT_BUILD = 'd34ae2ff';
+
 (function () {
   'use strict';
 
@@ -113,10 +126,33 @@
   }
 
   function fail(err) {
-    el.error.hidden = false;
-    el.error.textContent = 'Could not start the WebAssembly module: ' + err.message +
-      '. Serving the page over file:// blocks the .wasm fetch — use standalone.html instead.';
-    el.status.textContent = '';
+    if (el.error) {
+      el.error.hidden = false;
+      // Only blame file:// when the failure was actually the fetch. This used to
+      // say it whatever went wrong, which sent one real bug off in exactly the
+      // wrong direction.
+      var fetchFailed = /fetch|HTTP \d|Failed to|NetworkError|Load failed/i.test(err.message);
+      el.error.textContent = 'Could not start: ' + err.message +
+        (fetchFailed
+          ? '. Serving the page over file:// blocks the .wasm fetch — use standalone.html instead.'
+          : '. Try a hard reload (Ctrl/Cmd-Shift-R); a cached script from an older build can do this.');
+    }
+    if (el.status) el.status.textContent = '';
+    if (window.console) console.error(err);
+  }
+
+  /**
+   * Attach a handler, tolerating a control that is not on the page.
+   *
+   * The script and the markup are two files a host can serve from different
+   * generations, and when that happened a missing control threw out of
+   * `wireEvents` and took the whole game with it — a dead board because a
+   * <select> had been removed. A control that is not there is a control that
+   * does nothing.
+   */
+  function on(node, event, handler) {
+    if (node) node.addEventListener(event, handler);
+    return node;
   }
 
   /* ------------------------------------------------- reading module memory */
@@ -295,7 +331,7 @@
   }
 
   function neuralNote(text) {
-    el.neuralNote.textContent = text;
+    if (el.neuralNote) el.neuralNote.textContent = text;
   }
 
   /**
@@ -571,7 +607,7 @@
     });
     el.grid.addEventListener('mouseleave', function () { el.hover.textContent = ''; });
 
-    document.getElementById('btn-new').addEventListener('click', function () {
+    on(document.getElementById('btn-new'), 'click', function () {
       newGame(Number(el.width.value), Number(el.height.value), Number(el.mines.value));
     });
 
@@ -581,27 +617,24 @@
       });
     });
 
-    var probsBtn = document.getElementById('btn-probs');
-    probsBtn.addEventListener('click', function () {
+    var probsBtn = on(document.getElementById('btn-probs'), 'click', function () {
       showProbs = !showProbs;
-      probsBtn.classList.toggle('on', showProbs);
+      if (probsBtn) probsBtn.classList.toggle('on', showProbs);
       el.grid.classList.toggle('no-prob', !showProbs);
     });
 
-    var autoBtn = document.getElementById('btn-auto');
-    autoBtn.addEventListener('click', function () {
+    var autoBtn = on(document.getElementById('btn-auto'), 'click', function () {
       autoReveal = !autoReveal;
-      autoBtn.classList.toggle('on', autoReveal);
+      if (autoBtn) autoBtn.classList.toggle('on', autoReveal);
       if (autoReveal) scheduleCompute();
     });
 
-    var flagBtn = document.getElementById('btn-flagmode');
-    flagBtn.addEventListener('click', function () {
+    var flagBtn = on(document.getElementById('btn-flagmode'), 'click', function () {
       flagMode = !flagMode;
-      flagBtn.classList.toggle('on', flagMode);
+      if (flagBtn) flagBtn.classList.toggle('on', flagMode);
     });
 
-    el.show.addEventListener('change', function () { setShowMode(el.show.value); });
+    on(el.show, 'change', function () { setShowMode(el.show.value); });
 
   }
 
@@ -610,6 +643,7 @@
   function showBuild() {
     var stamp = document.getElementById('build');
     if (stamp) stamp.textContent = buildId() ? 'build ' + buildId() : 'unversioned build';
+
   }
 
   loadWasm().then(function (result) {
