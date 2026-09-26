@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::monte_carlo::SimSetup;
+use super::setup::SimSetup;
 
 /// One independent sub-problem: cells bound together by shared constraints, and
 /// sharing no cell with any other component.

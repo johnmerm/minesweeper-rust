@@ -175,9 +175,11 @@ A rescaled weight can underflow; a count cannot lie that way. Everything else is
 clamped strictly inside `(0, 1)` so no arithmetic accident can manufacture a
 proof.
 
-A **sampled** 0% means only that no draw happened to put a mine there. The Monte
-Carlo estimator is a fallback for when the exact search gives up, and nothing
-ever auto-opens on its numbers.
+There is no sampled estimator to confuse this with any more. Monte Carlo was
+deleted: over 71 mid-game positions the exact search answered all 71 in 20 ms in
+total while sampling answered 20 and took 4.4 seconds, and among its answers was
+a cell it called 0% that was not safe. When the exact search cannot finish, the
+API returns `None` and the front-ends show `?`.
 
 ---
 
@@ -185,10 +187,9 @@ ever auto-opens on its numbers.
 
 | | |
 |---|---|
-| Node budget | `ConstraintSearch::max_nodes`, default 1 000 000, checked at every node |
-| Past it | reports no result; caller falls back to Monte Carlo |
-| Monte Carlo | bounded too, and bails after `max_attempts / 10` with zero valid samples |
-| The fallback | **the open problem** — see *What is left* below |
+| Node budget | `ConstraintSearch::max_nodes`, default 4 000 000, checked at every node |
+| Past it | returns `None`; the caller shows `?` and no colour |
+| What is left | **the open problem** — see *What is left* below |
 | Offline | `ConstraintSearch::exhaustive()` removes the bound |
 | Worst measured solve | ~12 ms, boards up to 200 a side |
 
@@ -207,45 +208,49 @@ exactly the subtree that runs away.
 about how the board actually is, and an approximation that looks the same as an
 exact answer is a wrong claim dressed as a right one.
 
-Monte Carlo does not meet that bar and is not the goal. It is a stopgap for
-positions the exact search refuses, and while it is there the honest position is
-that a caller must be able to tell which kind of answer it received. Today it
-cannot: `calculate_mine_probabilities` returns a bare `Vec<Vec<f64>>` and the
-sampled numbers are indistinguishable from the exact ones. That is the gap to
-close, in the API and in every front-end that displays the result.
+Monte Carlo used to fill the gap and has been **deleted**. It could not meet
+that bar, and measured against the decomposing exact search it could not even
+beat it on speed. Over 71 mid-game positions:
+
+| | exact | Monte Carlo |
+|---|---|---|
+| answered | 71 of 71 | 20 of 71 |
+| total time | 20 ms | 4 449 ms |
+| worst error where both answered | — | 0.322 |
+| cells called 0% that were not safe | — | 1 |
+
+That last row is the one that settles it. A sampled 0% is read by every
+front-end as proof, and on 30x16/99 it was wrong.
+
+So the API says so now: `ProbabilityStrategy::calculate` and
+`Minesweeper::calculate_mine_probabilities` return `Option<Vec<Vec<f64>>>`, and
+`None` means *no answer*. Nothing substitutes for it. In the wasm ABI the same
+fact is `STAT_SOLVED`, and the page draws a distinct colour and a `?` rather
+than percentages — `probColor(0)` is the grey that means "certainly safe", so an
+unsolved board left untinted would read as a board with no mines on it.
 
 Exact counting of consistent layouts is #P-hard, so *exact always* and *fast
-always* cannot both be promised in the worst case. The way to hold the
-requirement anyway is:
+always* cannot both be promised. What is promised is that a number on screen is
+correct, and that a position which cannot be solved says so.
 
-1. make the exact method cover so much that the refusal is vanishingly rare, and
-2. when it does refuse, **say so** — never substitute a sample and present it as
-   the answer.
+### What is still refused, and why the budget cannot fix it
 
-### What that costs today
+Driving `docs/minesweeper.wasm` through 25 games per configuration, counting
+every `ms_compute`:
 
-Measured on 30x30/250, playing with `certain_cells` and opening the lowest cell
-when propagation runs dry: 663 solves, **3 refused by the node budget (0.5%)**.
-Each of those is solvable exactly — they need 1.2M to 3.8M nodes against the 1M
-budget, and cost 86 ms, 86 ms and 251 ms with the budget removed. One position
-found in an earlier sweep needed 10M nodes and 540 ms.
-
-So the refusals are not intractable positions. They are positions a few times
-past an arbitrary line, and the exact answer is a few hundred milliseconds away.
-
-The shipped page refuses more often than that, because it reuses a warm cache
-and plays differently. Driving `docs/minesweeper.wasm` through 25 games per
-configuration, counting every `ms_compute`:
-
-| board | solves | sampled | worst solve |
+| board | solves | unsolved | worst solve |
 |---|---|---|---|
-| 30x16/99 | 190 | 1 (0.5%) | 148 ms |
-| 30x30/250 | 148 | 8 (5.4%) | 224 ms |
+| 30x16/99 | 190 | 1 (0.5%) | 78 ms |
+| 30x30/250 | 148 | 8 (5.4%) | 127 ms |
 | 40x40/400 | 274 | 13 (4.7%) | 245 ms |
 
-So roughly one move in twenty on a dense board currently shows sampled numbers
-that look exactly like exact ones. Six games gave 27.6% on the middle row, which
-is noise — measure enough games before tuning to a figure.
+Raising `DEFAULT_MAX_NODES` is the obvious idea and it does not work. On
+30x30/250 the *same 8* positions are refused at 1M, 4M, 8M and 32M nodes — the
+budget buys nothing there and the worst solve grows from 127 ms to 2 935 ms,
+because the search spends all of it before giving up. Those positions are not a
+few times past an arbitrary line; they are genuinely large. Measure before
+touching this constant: an earlier run on an easier trajectory suggested every
+refusal was within reach, and it was not.
 
 ### The next step
 
@@ -256,18 +261,14 @@ re-deriving shared suffixes — and polynomial where the border is thin, which i
 usually is. It would subsume decomposition rather than replace it, since
 disconnected groups are just frontiers that never meet.
 
-Raising `max_nodes` is the cruder version of the same goal and buys most of the
-measured gap; it needs the work moved off the click first, the way the neural
-scoring pass already is, or a few hundred milliseconds lands on the main thread.
-
-
+That, not a bigger budget, is what closes the remaining few percent.
 ---
 
 ## Source
 
 | What | Where |
 |---|---|
-| Constraints, propagation, Monte Carlo | `minesweeper_core/src/probability/monte_carlo.rs` |
+| Constraints and propagation | `minesweeper_core/src/probability/setup.rs` |
 | Decomposition, combination, caching | `minesweeper_core/src/probability/components.rs` |
 | The depth-first search and its budget | `minesweeper_core/src/probability/constraint_search.rs` |
 | `certain_cells` | `minesweeper_core/src/probability/mod.rs` |

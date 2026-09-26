@@ -215,19 +215,21 @@ impl Minesweeper {
 }
 
 impl Minesweeper {
-    /// The probability that each unopened cell contains a mine.
+    /// The probability that each unopened cell contains a mine, or `None`.
     ///
-    /// Exact wherever the board allows it: [`ConstraintSearch`] enumerates the
-    /// consistent mine layouts and falls back to sampling on its own only when a
-    /// position is too tangled to finish within its budget. It used to delegate
-    /// straight to [`MonteCarlo`], which is now both slower and less accurate —
-    /// every front-end had already stopped using this method for that reason,
-    /// which left the one documented entry point as the worst way in.
+    /// Exact: [`ConstraintSearch`] counts the consistent mine layouts. `None`
+    /// means it could not finish within its node budget — not that the cells are
+    /// safe. There is deliberately no sampled fallback to return instead. An
+    /// estimate that might be wrong is indistinguishable from one that cannot be
+    /// by the time it reaches a cell, and measured against this search sampling
+    /// was not even faster: over 71 mid-game positions it answered 20 of them,
+    /// took 4.4 s against 20 ms, and among its answers was a 0% on a cell that
+    /// was not safe.
     ///
     /// Callers that make many moves should keep a [`ConstraintSearch`] instead of
     /// calling this: it caches its work between boards, and a fresh one per call
     /// throws that away.
-    pub fn calculate_mine_probabilities(&self) -> Vec<Vec<f64>> {
+    pub fn calculate_mine_probabilities(&self) -> Option<Vec<Vec<f64>>> {
         ConstraintSearch::new().calculate(self)
     }
 }

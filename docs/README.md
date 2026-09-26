@@ -78,15 +78,20 @@ It drives the same ABI the page uses — no npm install needed.
   touch screens.
 - Every hidden cell is tinted from grey to red by its estimated chance of
   hiding a mine, with the percentage in the corner.
-- **Estimator** picks how those numbers are produced: exact constraint search,
-  Monte Carlo sampling, or *auto*, which uses the exact search and falls back to
-  sampling only when the search finds no valid layout. The line under the board
-  reports how much work each one did; the highlighted line is the one being
-  displayed.
+- Every percentage is **exact**: the fraction of consistent mine layouts that
+  put a mine there. There is no sampled estimator — it was deleted, because it
+  could not beat the exact search on speed either, and because a sampled 0% is
+  read as proof of safety and was measured getting that wrong.
+
+  When the search cannot finish inside its node budget, the cells read `?` on a
+  colour of their own and the line under the board says so. Showing nothing is
+  the point: the grey of a 0% cell means *certainly safe*, so an unsolved board
+  drawn normally would claim the opposite of the truth. It happens on roughly
+  one move in twenty on a 30x30/250 board, and not at all on the standard ones.
 - **Auto-play deductions** opens every cell proven safe (0%) and flags every cell
   proven to be a mine (100%), repeating until nothing further follows. It only
-  acts on proof — never on a sampled estimate, where 0% merely means no sample
-  happened to put a mine there.
+  acts on proof — and with no sampled estimator left, a 0% on screen is always
+  a proof.
 
   On *neural network only* it follows the network instead, opening below 5% and
   flagging above 95%. The network never returns exactly 0 or 1, so a threshold is

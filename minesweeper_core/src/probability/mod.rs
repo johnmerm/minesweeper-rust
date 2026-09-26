@@ -1,18 +1,23 @@
 use crate::Minesweeper;
 
-pub mod monte_carlo;
+pub mod setup;
 pub mod components;
 pub(crate) mod patch;
 pub mod patch_cnn;
 pub mod constraint_search;
 #[cfg(feature = "neural")] pub mod neural;
-pub use monte_carlo::MonteCarlo;
 pub use constraint_search::ConstraintSearch;
 pub use patch_cnn::{BoardScorer, PatchCnn, WeightsError};
 #[cfg(feature = "neural")] pub use neural::NeuralNetwork;
 
 pub trait ProbabilityStrategy {
-    fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>>;
+    /// Per-cell mine probabilities, or `None` when this strategy cannot answer.
+    ///
+    /// `None` is the whole point of the return type. The obvious signature hands
+    /// back a grid whatever happens, and a grid of zeros is read by every caller
+    /// as proof that every cell is safe — so "I could not work it out" has to be
+    /// sayable, or it gets said as something else.
+    fn calculate(&self, game: &Minesweeper) -> Option<Vec<Vec<f64>>>;
 }
 
 /// Cells whose contents follow from the visible numbers alone.
@@ -40,7 +45,7 @@ pub struct CertainCells {
 /// without risk. Use it to make progress cheaply, and fall back to a full
 /// strategy when it runs dry.
 pub fn certain_cells(game: &Minesweeper) -> CertainCells {
-    match monte_carlo::SimSetup::build(game) {
+    match setup::SimSetup::build(game) {
         Some(setup) => CertainCells {
             mines: setup.certain_mines,
             safe: setup.certain_safe,
@@ -49,21 +54,24 @@ pub fn certain_cells(game: &Minesweeper) -> CertainCells {
     }
 }
 
+/// Which estimator produced a result.
+///
+/// There is no sampling variant, deliberately. An estimate that might be wrong
+/// has no place beside one that cannot be: they look identical by the time they
+/// reach a cell, and the caller acts on both the same way.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Strategy {
-    MonteCarlo,
+    /// Exact: counts the consistent layouts.
     ConstraintSearch,
-    /// Neural network estimator (ONNX), priority 1 — same as MC.
-    /// ConstraintSearch (priority 2) overrides it once it finishes.
+    /// The neural approximation. Never authoritative — a guess to compare
+    /// against the exact answer, never to act on.
     #[cfg(feature = "neural")] NeuralNetwork,
 }
 
 impl Strategy {
-    /// Higher value = more accurate (exact beats sampling).
-    /// Used by the GUI to decide which strategy's probs to display.
+    /// Higher value = more trustworthy. Used to decide which result to display.
     pub fn priority(self) -> u8 {
         match self {
-            Strategy::MonteCarlo => 1,
             Strategy::ConstraintSearch => 2,
             #[cfg(feature = "neural")] Strategy::NeuralNetwork => 1,
         }

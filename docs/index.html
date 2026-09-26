@@ -81,6 +81,7 @@
   #hover { margin-top: 10px; font-size: 14px; color: #555; min-height: 1.4em; }
   .sim { margin-top: 2px; font-size: 11px; line-height: 1.6; text-align: center; color: #888; }
   .sim .used { color: #335; font-weight: 600; }
+  .sim .unsolved { color: #a3521b; font-weight: 600; }
 
   .panel {
     margin-top: 16px; padding: 12px 16px;
@@ -135,13 +136,6 @@
 </div>
 
 <div class="panel">
-  <label>Estimator
-    <select id="in-strategy">
-      <option value="0">Auto (exact, else sampled)</option>
-      <option value="2">Constraint search (exact)</option>
-      <option value="1">Monte Carlo (sampled)</option>
-    </select>
-  </label>
   <button id="btn-probs" class="on">Show probabilities</button>
   <button id="btn-auto">Auto-play deductions</button>
   <button id="btn-flagmode">Flag mode</button>
@@ -157,6 +151,7 @@
 <p class="hint">
   Left click reveals &middot; right click (or <em>flag mode</em>) flags.<br>
   Cells are tinted from grey to red by the estimated chance they hide a mine.<br>
+  Every percentage is exact — the fraction of consistent mine layouts with a mine there. If the search cannot finish, the cells read <em>?</em> rather than a guess.<br>
   <em>Show</em> picks which estimate you see: the solver's proof, the network's guess (purple), or both — the guess in the top-left of each cell, the proof in the bottom-right.<br>
   <em>Auto-play deductions</em> opens every cell proven safe and flags every cell proven to be a mine. On <em>neural network only</em> it follows the network instead, opening under 5% and flagging over 95% — which is how you find out what the network is worth, and it will eventually open a mine.
 </p>
@@ -167,7 +162,7 @@
 
 <!-- Both lines are rewritten by wasm/bundle.py with a hash of the built files, so
      a cached copy of an old script can never be paired with a new page. -->
-<script>var MINESWEEPER_BUILD = "2c1814cf";</script>
-<script src="minesweeper.js?v=2c1814cf"></script>
+<script>var MINESWEEPER_BUILD = "0c682840";</script>
+<script src="minesweeper.js?v=0c682840"></script>
 </body>
 </html>

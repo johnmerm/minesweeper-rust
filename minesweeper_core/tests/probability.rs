@@ -12,6 +12,18 @@
 use minesweeper_core::probability::{certain_cells, ConstraintSearch, ProbabilityStrategy};
 use minesweeper_core::{CellContent, CellState, Minesweeper};
 
+/// The search's answer, insisting it produced one.
+///
+/// `calculate` returns `None` when the node budget runs out, which is a real
+/// outcome — but not one any of these positions should reach, and a test that
+/// quietly skipped it would be testing nothing.
+fn solved(search: &ConstraintSearch, game: &Minesweeper) -> Vec<Vec<f64>> {
+    search
+        .calculate(game)
+        .expect("the search refused a position this test expects it to solve")
+}
+
+
 /// Build a board with mines at the given coordinates and all numbers filled in,
 /// as if the player had already made their first click.
 fn board(width: usize, height: usize, mines: &[(usize, usize)]) -> Minesweeper {
@@ -149,7 +161,7 @@ fn oracle(game: &Minesweeper) -> Vec<Vec<f64>> {
 
 fn assert_matches_oracle(game: &Minesweeper, label: &str) {
     let expected = oracle(game);
-    let actual = ConstraintSearch::new().calculate(game);
+    let actual = solved(&ConstraintSearch::new(), game);
 
     for y in 0..game.height {
         for x in 0..game.width {
@@ -197,11 +209,11 @@ fn matches_oracle_with_interior_cells() {
 fn flags_do_not_change_probabilities() {
     let mut game = board(6, 4, &[(0, 0), (2, 1), (3, 3), (5, 0), (4, 2)]);
     show(&mut game, &[(1, 1), (2, 2), (3, 1), (4, 1), (1, 2), (3, 2)]);
-    let before = ConstraintSearch::new().calculate(&game);
+    let before = solved(&ConstraintSearch::new(), &game);
 
     game.toggle_flag(0, 0);
     game.toggle_flag(5, 3);
-    let after = ConstraintSearch::new().calculate(&game);
+    let after = solved(&ConstraintSearch::new(), &game);
 
     assert_eq!(before, after, "flagging a cell changed the estimate");
 }
@@ -226,7 +238,7 @@ fn probabilities_sum_to_remaining_mines() {
         ],
     );
 
-    let probs = ConstraintSearch::new().calculate(&game);
+    let probs = solved(&ConstraintSearch::new(), &game);
     let total: f64 = (0..game.height)
         .flat_map(|y| (0..game.width).map(move |x| (x, y)))
         .filter(|&(x, y)| game.grid[y][x].state != CellState::Visible)
@@ -360,7 +372,7 @@ fn propagation_agrees_with_the_exact_search() {
             if proven.safe.is_empty() && proven.mines.is_empty() {
                 return;
             }
-            let probs = ConstraintSearch::new().calculate(game);
+            let probs = solved(&ConstraintSearch::new(), game);
             for &(x, y) in &proven.safe {
                 assert_eq!(probs[y][x], 0.0, "({x}, {y}) proven safe but estimated non-zero");
             }
@@ -383,7 +395,7 @@ fn certain_cells_are_exact() {
         &[(1, 0), (2, 0), (3, 0), (1, 1), (2, 1), (3, 1), (1, 2), (2, 2), (3, 2)],
     );
 
-    let probs = ConstraintSearch::new().calculate(&game);
+    let probs = solved(&ConstraintSearch::new(), &game);
     assert_eq!(probs[0][0], 1.0, "a certain mine must read exactly 1.0");
     assert_eq!(probs[1][0], 0.0, "a certain safe cell must read exactly 0.0");
     assert_eq!(probs[2][0], 0.0, "a certain safe cell must read exactly 0.0");
@@ -417,7 +429,7 @@ fn propagation_is_never_wrong_on_a_large_sparse_board() {
 fn probabilities_stay_calibrated_on_large_boards() {
     for (width, height, mines) in [(50, 50, 150), (40, 40, 60), (30, 30, 99)] {
         sweep(width as u64 * 31 + mines as u64, width, height, mines, |game| {
-            let probs = ConstraintSearch::new().calculate(game);
+            let probs = solved(&ConstraintSearch::new(), game);
             let total: f64 = (0..game.height)
                 .flat_map(|y| (0..game.width).map(move |x| (x, y)))
                 .filter(|&(x, y)| game.grid[y][x].state != CellState::Visible)
@@ -480,26 +492,27 @@ fn separated_regions_compete_for_the_same_mines() {
 
     // Each corridor's single unopened cell must be a certain mine: its numbers
     // leave no alternative, and the two mines are exactly accounted for.
-    let probs = ConstraintSearch::new().calculate(&game);
+    let probs = solved(&ConstraintSearch::new(), &game);
     assert_eq!(probs[1][1], 1.0);
     assert_eq!(probs[1][9], 1.0);
 }
 
 /// `datagen` uses `ConstraintSearch::exhaustive()` to label training data, which
 /// lifts the node budget entirely. Without a budget the layout counts are larger,
-/// so this is where the arithmetic would run out of range first — and the failure
-/// would be silent, since an out-of-range answer falls back to sampling and
-/// sampled labels look like exact ones.
+/// so this is where the arithmetic would run out of range first.
 ///
 /// On any board where the budgeted search completes, the unbounded one must agree
-/// with it exactly: same algorithm, more room.
+/// with it exactly: same algorithm, more room. And wherever the budgeted one
+/// refuses, the unbounded one must still answer — that is the whole basis for
+/// labelling training data with it.
 #[test]
 fn the_unbounded_search_agrees_with_the_budgeted_one() {
     for seed in 0..10u64 {
         for (width, height, mines) in [(16, 16, 40), (30, 16, 99), (20, 20, 80)] {
             sweep(seed * 17 + 2, width, height, mines, |game| {
                 let budgeted = ConstraintSearch::new().calculate(game);
-                let unbounded = ConstraintSearch::exhaustive().calculate(game);
+                let unbounded = solved(&ConstraintSearch::exhaustive(), game);
+                let Some(budgeted) = budgeted else { return };
                 for y in 0..game.height {
                     for x in 0..game.width {
                         assert!(
@@ -530,6 +543,11 @@ fn a_warm_cache_changes_no_answer() {
                 let cached = warm.calculate(game);
                 // A solver that has never seen anything, for the same position.
                 let fresh = ConstraintSearch::new().calculate(game);
+                assert_eq!(
+                    cached.is_some(), fresh.is_some(),
+                    "a warm cache changed whether the search could answer at all"
+                );
+                let (Some(cached), Some(fresh)) = (cached, fresh) else { return };
                 for y in 0..game.height {
                     for x in 0..game.width {
                         assert_eq!(

@@ -7,8 +7,7 @@ use crate::Minesweeper;
 
 use super::{ProbabilityStrategy, SimUpdate, Strategy};
 use super::components::{combine, decompose, signature, ComponentSolution, SolutionCache};
-use super::monte_carlo::{build_probs, mc_memory_estimate, SimSetup};
-use super::MonteCarlo;
+use super::setup::{build_probs, memory_estimate, SimSetup};
 
 /// Exact mine probability estimation using depth-first constraint enumeration.
 ///
@@ -58,8 +57,9 @@ pub struct ConstraintSearch {
     /// The search is exponential in the size of the border, and on a dense board
     /// a single position can hold billions of consistent layouts — one 30x30/250
     /// position took over two minutes, which is indistinguishable from a hang.
-    /// Past this many nodes the search stops and reports no result, so the caller
-    /// falls back to sampling instead of waiting.
+    /// Past this many nodes the search stops and reports **no result**. Nothing
+    /// substitutes for it: there is no sampled fallback any more, so the caller
+    /// shows no probability rather than a wrong one.
     ///
     /// Set it to `usize::MAX` for an unbounded, always-exact search when latency
     /// does not matter (offline analysis, training-data generation).
@@ -73,10 +73,27 @@ pub struct ConstraintSearch {
     cache: RefCell<SolutionCache>,
 }
 
-/// Node budget that keeps a single solve inside a comfortable interactive
-/// frame on the boards measured here, while still finishing the vast majority
-/// of positions exactly.
-const DEFAULT_MAX_NODES: usize = 1_000_000;
+/// Node budget for an interactive solve.
+///
+/// Past it the search reports nothing and the caller shows nothing — there is
+/// no sampled fallback any more — so the number is a trade between how often a
+/// player sees `?` and how long they wait to be told. Measured by driving the
+/// wasm build through 25 games per configuration:
+///
+/// ```text
+/// budget   30x16/99   30x30/250   40x40/400   worst solve
+///     1M    1 (0.5%)    8 (5.4%)   13 (4.7%)        127 ms
+///     4M    1 (0.5%)    8 (5.4%)    0 (0.0%)        375 ms
+///     8M    1 (0.5%)    8 (5.4%)    0 (0.0%)        732 ms
+///    32M    0 (0.0%)    8 (5.4%)    0 (0.0%)      2 935 ms
+/// ```
+///
+/// 4M clears every refusal on the largest board and is the last increase that
+/// buys anything: beyond it the cost doubles and then quadruples for one extra
+/// position. The eight on 30x30/250 are the *same eight* at every budget — they
+/// are genuinely large, not marginally over a line, and only a better algorithm
+/// reaches them.
+const DEFAULT_MAX_NODES: usize = 4_000_000;
 
 impl ConstraintSearch {
     pub fn new() -> Self {
@@ -128,15 +145,15 @@ impl ConstraintSearch {
         let outcome = self.solve(&setup);
 
         let (probs, valid, attempts) = match outcome {
-            Some(solved) => (
+            Ok(solved) => (
                 build_probs(&solved.probabilities, 1.0, &setup, game.width, game.height),
                 solved.layouts,
                 solved.nodes,
             ),
-            // No usable answer — the caller falls back to sampling. Reporting zero
-            // layouts is what tells it to; a grid of zeros would read as "every
-            // cell is provably safe".
-            None => (empty(), 0, 0),
+            // No usable answer. Zero layouts is what says so — a grid of zeros
+            // would read as "every cell is provably safe" — and the node count
+            // is still reported, because the caller shows it.
+            Err(nodes) => (empty(), 0, nodes),
         };
 
         let _ = tx.send(SimUpdate::Done {
@@ -148,9 +165,12 @@ impl ConstraintSearch {
         });
     }
 
-    /// Solve every component and combine them, or `None` if no trustworthy answer
-    /// came out.
-    fn solve(&self, setup: &SimSetup) -> Option<Solved> {
+    /// Solve every component and combine them.
+    ///
+    /// `Err` carries the nodes spent before giving up, so a caller can report
+    /// how much work went into producing nothing — "no answer within 0 nodes"
+    /// is a confusing thing to be told.
+    fn solve(&self, setup: &SimSetup) -> Result<Solved, usize> {
         let components = decompose(setup);
 
         // Cells no number speaks about. They are not searched: their probability
@@ -195,7 +215,7 @@ impl ConstraintSearch {
             );
             dfs.run(0);
             if dfs.exhausted {
-                return None;
+                return Err(nodes + dfs.nodes);
             }
             remaining = remaining.saturating_sub(dfs.nodes);
             nodes += dfs.nodes;
@@ -209,8 +229,10 @@ impl ConstraintSearch {
             solutions.push(solution);
         }
 
-        let probabilities = combine(setup, &components, &solutions, &interior)?;
-        Some(Solved {
+        let Some(probabilities) = combine(setup, &components, &solutions, &interior) else {
+            return Err(nodes);
+        };
+        Ok(Solved {
             probabilities,
             // With no constrained cells at all there is still exactly one layout:
             // the empty one. Reporting zero would read as "no answer".
@@ -228,19 +250,12 @@ struct Solved {
 }
 
 impl ProbabilityStrategy for ConstraintSearch {
-    /// Synchronous version used by the CLI / web — runs to completion and returns probs.
-    fn calculate(&self, game: &Minesweeper) -> Vec<Vec<f64>> {
-        let Some(setup) = SimSetup::build(game) else {
-            return vec![vec![0.0; game.width]; game.height];
-        };
-        match self.solve(&setup) {
-            Some(solved) => {
-                build_probs(&solved.probabilities, 1.0, &setup, game.width, game.height)
-            }
-            // This signature has no way to say "no answer", and zeros would be read
-            // as proof of safety, so hand back a sampled estimate instead.
-            None => MonteCarlo::new().calculate(game),
-        }
+    /// Runs to completion. `None` when the node budget is exhausted before the
+    /// count is complete — the caller must not treat that as a grid of zeros.
+    fn calculate(&self, game: &Minesweeper) -> Option<Vec<Vec<f64>>> {
+        let setup = SimSetup::build(game)?;
+        let solved = self.solve(&setup).ok()?;
+        Some(build_probs(&solved.probabilities, 1.0, &setup, game.width, game.height))
     }
 }
 
@@ -517,8 +532,8 @@ fn cs_memory_estimate(setup: &SimSetup) -> usize {
     let total_neighbors: usize = setup.constraints.iter().map(|(ns, _)| ns.len()).sum();
     let c = setup.constraints.len();
 
-    // SimSetup heap (same formula as in mc_memory_estimate)
-    let setup_heap = mc_memory_estimate(setup);
+    // SimSetup heap (same formula as in memory_estimate)
+    let setup_heap = memory_estimate(setup);
 
     // The dominant term is the per-group tables: `cell_ways` holds one row of
     // `mines + 1` counts per cell. Estimated against the whole border rather than

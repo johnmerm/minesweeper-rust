@@ -30,7 +30,7 @@ use tract_onnx::prelude::*;
 
 use crate::Minesweeper;
 
-use super::monte_carlo::{build_probs, mc_memory_estimate, SimSetup};
+use super::setup::{build_probs, memory_estimate, SimSetup};
 use super::patch::{PatchSource, N_CHANNELS, PATCH, PATCH_LEN};
 use super::{SimUpdate, Strategy};
 
@@ -83,7 +83,7 @@ impl NeuralNetwork {
             return;
         };
 
-        let memory_bytes = mc_memory_estimate(&setup);
+        let memory_bytes = memory_estimate(&setup);
         let hidden = &setup.hidden_cells;
         let n_hidden = hidden.len();
 

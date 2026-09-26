@@ -20,7 +20,7 @@
 //! | `ms_auto_reveal(mode)` | Reveal every provably-safe cell, repeatedly |
 //! | `ms_cells_ptr()` | `u8[width * height]` — see [`encode_cell`] |
 //! | `ms_probs_ptr()` | `f32[width * height]` — mine probability per cell |
-//! | `ms_stats_ptr()` | `u32[9]` — see the `STAT_*` constants |
+//! | `ms_stats_ptr()` | `u32[6]` — see the `STAT_*` constants |
 //! | `ms_width()` / `ms_height()` / `ms_mines()` / `ms_state()` | Scalars |
 //!
 //! Buffers are reallocated by `ms_new`, and the module's linear memory can be
@@ -30,36 +30,27 @@
 use std::cell::RefCell;
 use std::sync::mpsc::Sender;
 
-use minesweeper_core::probability::{certain_cells, BoardScorer, ConstraintSearch, MonteCarlo, PatchCnn, SimUpdate};
+use minesweeper_core::probability::{certain_cells, BoardScorer, ConstraintSearch, PatchCnn, SimUpdate};
 use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
 
 mod rng;
 
-/// Probability strategy requested by the caller of [`ms_compute`].
-mod mode {
-    /// Exact constraint search, falling back to Monte Carlo if it finds no layout.
-    pub const AUTO: u32 = 0;
-    /// Monte Carlo sampling only.
-    pub const MONTE_CARLO: u32 = 1;
-    /// Constraint search only.
-    pub const CONSTRAINT_SEARCH: u32 = 2;
-}
-
 // Indices into the `u32` array exposed by [`ms_stats_ptr`].
-const STAT_MC_VALID: usize = 0;
-const STAT_MC_ATTEMPTS: usize = 1;
-const STAT_MC_MEMORY: usize = 2;
-const STAT_CS_VALID: usize = 3;
-const STAT_CS_ATTEMPTS: usize = 4;
-const STAT_CS_MEMORY: usize = 5;
-/// Which strategy's numbers ended up in the probability buffer: one of `mode::*`
-/// (never `AUTO` — it is resolved to the strategy actually used).
-const STAT_USED: usize = 6;
+const STAT_VALID: usize = 0;
+const STAT_NODES: usize = 1;
+const STAT_MEMORY: usize = 2;
+/// 1 when the probability buffer holds a finished exact solve, 0 when the
+/// search hit its budget and there is nothing to show.
+///
+/// There is no third value. Sampling used to fill this buffer when the search
+/// gave up, and a sampled number is indistinguishable from an exact one by the
+/// time it reaches a cell.
+const STAT_SOLVED: usize = 3;
 /// Component solves served from the cache since the page loaded, and solves that
 /// had to be done. Cumulative, not per move.
-const STAT_CACHE_HITS: usize = 7;
-const STAT_CACHE_MISSES: usize = 8;
-const STAT_LEN: usize = 9;
+const STAT_CACHE_HITS: usize = 4;
+const STAT_CACHE_MISSES: usize = 5;
+const STAT_LEN: usize = 6;
 
 /// The trained network, built into the module.
 ///
@@ -139,42 +130,23 @@ impl AppState {
         }
     }
 
-    /// Recompute mine probabilities with the requested strategy.
-    fn compute(&mut self, mode: u32) {
+    /// Recompute mine probabilities. Exact or not at all.
+    fn compute(&mut self) {
         self.stats = [0; STAT_LEN];
 
-        // Exact enumeration runs first: it is usually far cheaper than a million
-        // Monte Carlo draws and its answers are exact, so in AUTO mode we only
-        // pay for sampling when the search comes back with no valid layout
-        // (which happens on a fresh board, where there are no constraints yet).
-        let cs = (mode != mode::MONTE_CARLO)
-            .then(|| run_sync(|tx| self.exact.calculate_with_progress(&self.game, tx)));
-        let cs_ok = cs.as_ref().map_or(false, |run| run.valid > 0);
-        let mc = (mode == mode::MONTE_CARLO || (mode == mode::AUTO && !cs_ok))
-            .then(|| run_sync(|tx| MonteCarlo::new().calculate_with_progress(&self.game, tx)));
+        let run = run_sync(|tx| self.exact.calculate_with_progress(&self.game, tx));
+        self.stats[STAT_VALID] = run.valid as u32;
+        self.stats[STAT_NODES] = run.attempts as u32;
+        self.stats[STAT_MEMORY] = run.memory_bytes as u32;
+        self.stats[STAT_SOLVED] = (run.valid > 0) as u32;
 
-        if let Some(run) = &mc {
-            self.stats[STAT_MC_VALID] = run.valid as u32;
-            self.stats[STAT_MC_ATTEMPTS] = run.attempts as u32;
-            self.stats[STAT_MC_MEMORY] = run.memory_bytes as u32;
-        }
-        if let Some(run) = &cs {
-            self.stats[STAT_CS_VALID] = run.valid as u32;
-            self.stats[STAT_CS_ATTEMPTS] = run.attempts as u32;
-            self.stats[STAT_CS_MEMORY] = run.memory_bytes as u32;
-        }
-
-        let (probs, used) = match (cs, mc) {
-            (Some(cs), _) if cs.valid > 0 => (cs.probs, mode::CONSTRAINT_SEARCH),
-            (_, Some(mc)) => (mc.probs, mode::MONTE_CARLO),
-            (Some(cs), None) => (cs.probs, mode::CONSTRAINT_SEARCH),
-            (None, None) => (Vec::new(), mode::AUTO),
-        };
-        self.stats[STAT_USED] = used;
         let (hits, misses) = self.exact.cache_counts();
         self.stats[STAT_CACHE_HITS] = hits;
         self.stats[STAT_CACHE_MISSES] = misses;
-        self.store_probs(&probs);
+
+        // On a refusal the buffer is left holding nothing rather than a guess.
+        // `STAT_SOLVED` is how the page knows not to draw it.
+        self.store_probs(if run.valid > 0 { &run.probs } else { &[] });
     }
 
     fn store_probs(&mut self, probs: &[Vec<f64>]) {
@@ -200,7 +172,7 @@ impl AppState {
     /// propagation has run dry — that last step is what catches the cells only a
     /// full enumeration can prove safe. In practice that turns dozens of solves
     /// into one or two.
-    fn auto_reveal(&mut self, mode: u32) -> u32 {
+    fn auto_reveal(&mut self) -> u32 {
         if self.game.state != GameState::Playing || !self.game.mines_generated {
             return 0;
         }
@@ -226,13 +198,12 @@ impl AppState {
             // Propagation is exhausted, so it is worth one full solve to see
             // whether anything else is provably safe.
             self.sync_cells();
-            self.compute(mode);
+            self.compute();
 
-            // Only the exact search proves anything. A sampled 0% just means no
-            // draw happened to put a mine there, and opening on that would
-            // eventually detonate one — so if the search bailed out and we are
-            // looking at a Monte Carlo estimate, stop here.
-            if self.stats[STAT_USED] != mode::CONSTRAINT_SEARCH {
+            // Only a finished solve proves anything. If the search gave up there
+            // is nothing in the buffer to act on, so stop rather than reading
+            // whatever is there as a row of zeros.
+            if self.stats[STAT_SOLVED] == 0 {
                 break;
             }
 
@@ -257,7 +228,7 @@ impl AppState {
         self.sync_cells();
         // Leave the probability buffer describing the board JavaScript is about
         // to draw, not the one we started from.
-        self.compute(mode);
+        self.compute();
         revealed
     }
 
@@ -379,17 +350,16 @@ pub extern "C" fn ms_flag(x: u32, y: u32) {
     });
 }
 
-/// Recompute probabilities; `mode` is one of the `mode::*` constants.
+/// Recompute probabilities. Check `STAT_SOLVED` before reading the buffer.
 #[no_mangle]
-pub extern "C" fn ms_compute(mode: u32) {
-    with_state(|state| state.compute(mode));
+pub extern "C" fn ms_compute() {
+    with_state(|state| state.compute());
 }
 
 /// Reveal all provably-safe cells; returns how many were revealed.
-/// `mode` selects the estimator used between passes, as in [`ms_compute`].
 #[no_mangle]
-pub extern "C" fn ms_auto_reveal(mode: u32) -> u32 {
-    with_state(|state| state.auto_reveal(mode))
+pub extern "C" fn ms_auto_reveal() -> u32 {
+    with_state(|state| state.auto_reveal())
 }
 
 #[no_mangle]
@@ -486,8 +456,9 @@ pub extern "C" fn ms_neural_probs_ptr() -> *const f32 {
 ///
 /// `rate_millis` is the learning rate x1000; zero scores without training. The
 /// targets are whatever is in `ms_probs_ptr`, so the caller must only pass a
-/// non-zero rate after an *exact* solve — a sampled estimate is noise, and a
-/// network taught from noise learns the noise.
+/// non-zero rate after a solve that *finished* — `STAT_SOLVED` says whether one
+/// did, and an unfinished solve leaves the buffer empty, which would teach the
+/// network that every cell is safe.
 ///
 /// Training rides the scoring pass rather than running as a second one, because
 /// the forward pass is the same forward pass. Done separately over a whole board

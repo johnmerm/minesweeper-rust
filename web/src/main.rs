@@ -1,6 +1,6 @@
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
 use minesweeper_core::{Minesweeper, CellState, CellContent, GameState};
-use minesweeper_core::probability::{certain_cells, ConstraintSearch, MonteCarlo, SimUpdate};
+use minesweeper_core::probability::{certain_cells, ConstraintSearch, SimUpdate};
 use std::sync::{Mutex, mpsc::Sender};
 use tera::{Tera, Context};
 use serde::{Deserialize, Serialize};
@@ -136,30 +136,28 @@ async fn index(data: web::Data<AppState>) -> impl Responder {
     let (cs_probs, cs_valid, cs_attempts, cs_mem) =
         run_sync(|tx| exact.calculate_with_progress(&game, tx));
 
-    // Sampling only when the exact search came back with nothing: it is slower
-    // and less accurate, so running it every time was pure waste.
-    let (mc_probs, mc_valid, mc_attempts, mc_mem) = if cs_valid > 0 {
-        (Vec::new(), 0, 0, 0)
+    // No fallback. When the search cannot finish, the page shows no numbers
+    // rather than numbers that might be wrong.
+    let solved = cs_valid > 0;
+    let status = if solved {
+        format!("exact: {} layouts / {} steps  [{}]", cs_valid, cs_attempts, fmt_memory(cs_mem))
     } else {
-        run_sync(|tx| MonteCarlo::new().calculate_with_progress(&game, tx))
+        format!("no exact answer within {} steps — probabilities withheld", cs_attempts)
     };
-
-    let probs = if cs_valid > 0 { cs_probs } else { mc_probs };
-
-    let mc_status = format!(
-        "MC: {} valid / {} sampled  [{}]",
-        mc_valid, mc_attempts, fmt_memory(mc_mem)
-    );
-    let cs_status = format!(
-        "CS: {} layouts / {} steps  [{}]",
-        cs_valid, cs_attempts, fmt_memory(cs_mem)
-    );
 
     let grid_view: Vec<Vec<CellView>> = (0..game.height)
         .map(|y| {
             (0..game.width)
                 .map(|x| {
-                    let p = probs[y][x];
+                    if !solved {
+                        return CellView {
+                            state: game.grid[y][x].state,
+                            content: game.grid[y][x].content,
+                            prob_color: "rgb(204,204,204)".to_string(),
+                            prob_pct: "?".to_string(),
+                        };
+                    }
+                    let p = cs_probs[y][x];
                     let r = (204.0 + 51.0 * p).round() as u8;
                     let g = (204.0 * (1.0 - p)).round() as u8;
                     CellView {
@@ -179,8 +177,7 @@ async fn index(data: web::Data<AppState>) -> impl Responder {
     context.insert("mines_count", &game.mines_count);
     context.insert("state", &game.state);
     context.insert("grid", &grid_view);
-    context.insert("mc_status", &mc_status);
-    context.insert("cs_status", &cs_status);
+    context.insert("status", &status);
     context.insert("settings_width",  &sw);
     context.insert("settings_height", &sh);
     context.insert("settings_mines",  &sm);

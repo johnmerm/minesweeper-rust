@@ -45,7 +45,7 @@ check('board dimensions', g.e.ms_width() === 10 && g.e.ms_height() === 10 && g.e
 check('starts fully hidden', [...g.cells()].every((c) => c === HIDDEN));
 check('starts playing', g.e.ms_state() === 0);
 
-g.e.ms_compute(0);
+g.e.ms_compute();
 check('untouched board is uniform', Math.abs(g.probs()[0] - 0.1) < 1e-6, g.probs()[0]);
 
 g.e.ms_reveal(4, 4);
@@ -61,7 +61,7 @@ for (const [w, h, m] of [[9, 9, 10], [16, 16, 40], [30, 16, 99]]) {
   const t0 = Date.now();
   g.e.ms_new(w, h, m);
   g.e.ms_reveal(w >> 1, h >> 1);
-  g.e.ms_compute(0);
+  g.e.ms_compute();
   const c = g.cells(), p = g.probs();
   let sum = 0;
   for (let i = 0; i < w * h; i++) if (c[i] === HIDDEN || c[i] === FLAGGED) sum += p[i];
@@ -75,8 +75,8 @@ g.e.ms_new(16, 16, 40);
 g.e.ms_reveal(8, 8);
 let rounds = 0;
 while (g.e.ms_state() === 0 && rounds++ < 300) {
-  g.e.ms_compute(0);
-  if (g.e.ms_auto_reveal(0) > 0) continue;
+  g.e.ms_compute();
+  if (g.e.ms_auto_reveal() > 0) continue;
   const c = g.cells(), p = g.probs();
   let best = -1;
   for (let i = 0; i < c.length; i++) if (c[i] === HIDDEN && (best < 0 || p[i] < p[best])) best = i;
@@ -111,7 +111,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
   big.e.ms_new(120, 120, 1800);
   const started = Date.now();
   big.e.ms_reveal(60, 60);
-  big.e.ms_compute(0);
+  big.e.ms_compute();
   const took = Date.now() - started;
   const cells = big.cells(), probs = big.probs();
   let sum = 0;
@@ -135,9 +135,9 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
       s.e.ms_reveal(w >> 1, h >> 1);
       games++;
       for (let move = 1; move <= 20 && s.e.ms_state() === 0; move++) {
-        s.e.ms_compute(0);
+        s.e.ms_compute();
         const started = Date.now();
-        opened += s.e.ms_auto_reveal(0);
+        opened += s.e.ms_auto_reveal();
         const took = Date.now() - started;
         if (took > slowest) { slowest = took; slowestOn = `${w}x${h}/${m} seed ${seed}`; }
         if (s.e.ms_state() === 2) { detonations++; break; }
@@ -167,8 +167,8 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
       s.e.ms_reveal(w >> 1, h >> 1);
       games++;
       for (let move = 1; move <= 12 && s.e.ms_state() === 0; move++) {
-        s.e.ms_compute(0);
-        s.e.ms_auto_reveal(0);
+        s.e.ms_compute();
+        s.e.ms_auto_reveal();
         if (s.e.ms_state() !== 0) break;
         const cells = s.cells(), probs = s.probs();
         let best = -1;
@@ -190,13 +190,57 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
         `${games} games, ${flagged} flags placed, ${wrong} on non-mines`);
 }
 
+// The solver answers exactly or not at all — there is no sampled fallback to
+// quietly fill the buffer, so a board it cannot finish must say so rather than
+// leaving zeros behind, which every caller reads as "all safe".
+{
+  const s = await load(3, 5);
+  const STAT_SOLVED = 3;
+  s.e.ms_new(16, 16, 40);
+  s.e.ms_reveal(8, 8);
+  s.e.ms_compute();
+  const stats = s.stats();
+  check('a solved board says so', stats[STAT_SOLVED] === 1);
+
+  // Whenever it claims a solve, the numbers must account for exactly the mines
+  // left; whenever it does not, it must not have left numbers lying around.
+  let checked = 0;
+  for (let seed = 1; seed <= 6; seed++) {
+    const t = await load(seed, seed * 31);
+    t.e.ms_new(30, 30, 250);
+    t.e.ms_reveal(15, 15);
+    for (let move = 0; move < 12 && t.e.ms_state() === 0; move++) {
+      t.e.ms_compute();
+      const st = t.stats(), c = t.cells(), p = t.probs();
+      let sum = 0;
+      for (let i = 0; i < 900; i++) if (c[i] === HIDDEN || c[i] === FLAGGED) sum += p[i];
+      if (st[STAT_SOLVED]) {
+        if (Math.abs(sum - (250 - t.e.ms_flags() * 0)) > 0.5 && Math.abs(sum - 250) > 0.5) {
+          check('a claimed solve accounts for every mine', false, `sum ${sum.toFixed(2)}`);
+          checked = -1000;
+        }
+      } else if (sum !== 0) {
+        check('an unsolved board leaves no numbers', false, `sum ${sum}`);
+        checked = -1000;
+      }
+      checked++;
+      if (t.e.ms_auto_reveal()) continue;
+      let best = -1;
+      for (let i = 0; i < 900; i++) if (c[i] === HIDDEN && (best < 0 || p[i] < p[best])) best = i;
+      if (best < 0) break;
+      t.e.ms_reveal(best % 30, Math.floor(best / 30));
+    }
+  }
+  check('exact-or-nothing holds across a dense game', checked > 0, `${checked} positions`);
+}
+
 // A grid that reads 0% everywhere would mean "all safe"; the estimates must
 // always account for exactly the mines that are left.
 {
   const s = await load(1, 2);
   s.e.ms_new(50, 50, 150);
   s.e.ms_reveal(25, 25);
-  s.e.ms_compute(0);
+  s.e.ms_compute();
   const cells = s.cells(), probs = s.probs();
   let sum = 0;
   for (let i = 0; i < 2500; i++) if (cells[i] === HIDDEN || cells[i] === FLAGGED) sum += probs[i];
@@ -218,7 +262,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
     check('the built-in weights parse', s.e.ms_model_load() === 1 && s.e.ms_model_ready() === 1);
 
     s.e.ms_reveal(8, 8);
-    s.e.ms_compute(0);
+    s.e.ms_compute();
     const total = s.e.ms_neural_begin(0);
     const hidden = [...s.cells()].filter((c) => c === HIDDEN || c === FLAGGED).length;
     check('every unopened cell is scheduled', total === hidden, `${total} vs ${hidden}`);
@@ -332,7 +376,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
   if (!s) {
     check('a mid-game board to hand the network', false, 'no seed produced one');
   } else {
-    s.e.ms_compute(0);
+    s.e.ms_compute();
     s.e.ms_neural_begin(0);
     while (s.e.ms_neural_step(256) > 0) { /* finish scoring */ }
 
@@ -343,7 +387,7 @@ check('board size is clamped', g.e.ms_width() === 3 && g.e.ms_height() === 200 &
       opened += acted >>> 16;
       flagged += acted & 0xffff;
       passes++;
-      s.e.ms_compute(0);
+      s.e.ms_compute();
       s.e.ms_neural_begin(0);
       while (s.e.ms_neural_step(256) > 0) { /* rescore */ }
     }

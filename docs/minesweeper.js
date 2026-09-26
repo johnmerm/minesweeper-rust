@@ -16,10 +16,8 @@
   // Cell byte encodings, mirroring `cell_code` in wasm/src/lib.rs.
   var VISIBLE_MINE = 9, HIDDEN = 10, FLAGGED = 11;
   // Indices into the u32 stats array, mirroring the STAT_* constants.
-  var STAT_MC_VALID = 0, STAT_MC_ATTEMPTS = 1, STAT_MC_MEMORY = 2,
-      STAT_CS_VALID = 3, STAT_CS_ATTEMPTS = 4, STAT_CS_MEMORY = 5, STAT_USED = 6,
-      STAT_CACHE_HITS = 7, STAT_CACHE_MISSES = 8;
-  var MODE_AUTO = 0, MODE_MC = 1, MODE_CS = 2;
+  var STAT_VALID = 0, STAT_NODES = 1, STAT_MEMORY = 2, STAT_SOLVED = 3,
+      STAT_CACHE_HITS = 4, STAT_CACHE_MISSES = 5;
 
   var wasm = null;          // the module's exports
   var cellEls = [];         // one DOM node per board cell, rebuilt on new game
@@ -72,7 +70,6 @@
     width: document.getElementById('in-width'),
     height: document.getElementById('in-height'),
     mines: document.getElementById('in-mines'),
-    strategy: document.getElementById('in-strategy'),
     neuralNote: document.getElementById('neural-note'),
     show: document.getElementById('in-show')
   };
@@ -166,6 +163,10 @@
     el.grid.appendChild(frag);
   }
 
+  /** A cell on a board the solver could not finish. Deliberately not the grey
+   *  that probColor(0) produces, which is what "certainly safe" looks like. */
+  var UNKNOWN = 'rgb(198,203,214)';
+
   /** Grey → red tint, matching the CLI, Qt and Actix front-ends. */
   function probColor(p) {
     var r = Math.round(204 + 51 * p);
@@ -175,6 +176,10 @@
 
   function render() {
     var c = cells(), p = probs();
+    // Without a finished solve the buffer holds nothing, and probColor(0) is the
+    // very grey that means "safe". An unsolved board therefore gets a colour of
+    // its own and a '?', or it would read as a board with no mines on it.
+    var known = solved();
     // -1 marks a cell the network has not reached yet, which is why the buffer
     // cannot simply start at zero: nearly-zero is a real answer here.
     var g = neuralOn() ? neuralProbs() : null;
@@ -190,9 +195,9 @@
         text = code === FLAGGED ? '⚑' : '';
         // The tint follows whichever estimate is being shown, so in 'neural' the
         // colour is the network's opinion and not a proof wearing its clothes.
-        var tint = exact ? p[i] : (g && g[i] >= 0 ? g[i] : -1);
-        bg = tint >= 0 ? probColor(tint) : '';
-        pct = exact ? Math.round(p[i] * 100) + '%' : '';
+        var tint = exact ? (known ? p[i] : -1) : (g && g[i] >= 0 ? g[i] : -1);
+        bg = tint >= 0 ? probColor(tint) : (exact && !known ? UNKNOWN : '');
+        pct = exact ? (known ? Math.round(p[i] * 100) + '%' : '?') : '';
       } else if (code === VISIBLE_MINE) {
         cls += ' visible mine';
         text = '✹';
@@ -258,33 +263,28 @@
     return ' · ' + Math.round(100 * s[STAT_CACHE_HITS] / looked) + '% reused';
   }
 
+  function solved() {
+    return stats()[STAT_SOLVED] === 1;
+  }
+
   function renderSim() {
     var s = stats();
-    var lines = [];
-    if (s[STAT_CS_ATTEMPTS] > 0 || s[STAT_CS_VALID] > 0) {
-      lines.push({
-        used: s[STAT_USED] === MODE_CS,
-        // "layouts" is the sum over independent regions, not the product: the
-        // solver splits the board and never enumerates the whole cross-product.
-        text: 'exact: ' + s[STAT_CS_VALID].toLocaleString() + ' region layouts / ' +
-              s[STAT_CS_ATTEMPTS].toLocaleString() + ' nodes [' + formatBytes(s[STAT_CS_MEMORY]) + ']' +
-              reuse(s)
-      });
-    }
-    if (s[STAT_MC_ATTEMPTS] > 0 || s[STAT_MC_VALID] > 0) {
-      lines.push({
-        used: s[STAT_USED] === MODE_MC,
-        text: 'sampled: ' + s[STAT_MC_VALID].toLocaleString() + ' valid / ' +
-              s[STAT_MC_ATTEMPTS].toLocaleString() + ' draws [' + formatBytes(s[STAT_MC_MEMORY]) + ']'
-      });
+    var div = document.createElement('div');
+    if (solved()) {
+      div.className = 'used';
+      // "layouts" is the sum over independent regions, not the product: the
+      // solver splits the board and never enumerates the whole cross-product.
+      div.textContent = 'exact: ' + s[STAT_VALID].toLocaleString() + ' region layouts / ' +
+          s[STAT_NODES].toLocaleString() + ' nodes [' + formatBytes(s[STAT_MEMORY]) + ']' + reuse(s);
+    } else {
+      // There is nothing to fall back to, and that is deliberate: a sampled
+      // number reads exactly like a proved one once it is in a cell.
+      div.className = 'unsolved';
+      div.textContent = 'no exact answer within ' + s[STAT_NODES].toLocaleString() +
+          ' nodes — showing none rather than guessing';
     }
     el.sim.textContent = '';
-    lines.forEach(function (line) {
-      var div = document.createElement('div');
-      if (line.used) div.className = 'used';
-      div.textContent = line.text;
-      el.sim.appendChild(div);
-    });
+    el.sim.appendChild(div);
   }
 
   /* --------------------------------------------------------- neural overlay */
@@ -384,15 +384,15 @@
   /**
    * How hard to correct the network during the next scoring pass, or 0.
    *
-   * Two gates. Only after an *exact* solve: the sampled estimator's numbers carry
-   * noise, and a network taught from noise learns the noise. And only in the
+   * Two gates. Only after a solve that finished: an unfinished one leaves the
+   * buffer empty, which would teach the network that everything is safe. And only in the
    * modes where the solver is on screen — in 'neural' the whole point is to see
    * what the network does unaided, and a network being corrected by the solver
    * mid-run is not the thing being measured.
    */
   function learningRate() {
     if (showMode === 'neural') return 0;
-    return stats()[STAT_USED] === MODE_CS ? 20 : 0;   // rate 0.02
+    return solved() ? 20 : 0;   // rate 0.02
   }
 
   /**
@@ -472,11 +472,11 @@
     el.sim.textContent = 'calculating…';
     pendingCompute = setTimeout(function () {
       pendingCompute = null;
-      wasm.ms_compute(Number(el.strategy.value));
+      wasm.ms_compute();
       // Proof-driven auto-play only when a proof is what is on screen. In
       // 'neural' the network drives instead, which it cannot do until it has
       // scored the board — so that runs off the end of the scoring pass.
-      if (autoReveal && showMode !== 'neural') wasm.ms_auto_reveal(Number(el.strategy.value));
+      if (autoReveal && showMode !== 'neural') wasm.ms_auto_reveal();
       render();
       renderSim();
       // After the exact numbers, never instead of them.
@@ -559,7 +559,9 @@
       }
       var parts = [];
       if (showMode !== 'neural') {
-        parts.push('Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%');
+        parts.push(solved()
+          ? 'Mine probability: ' + (probs()[i] * 100).toFixed(1) + '%'
+          : 'Mine probability: not known — the search did not finish');
       }
       if (neuralOn()) {
         var guess = neuralProbs()[i];
@@ -601,7 +603,6 @@
 
     el.show.addEventListener('change', function () { setShowMode(el.show.value); });
 
-    el.strategy.addEventListener('change', scheduleCompute);
   }
 
   /* ------------------------------------------------------------------ start */
