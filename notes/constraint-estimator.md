@@ -188,6 +188,7 @@ ever auto-opens on its numbers.
 | Node budget | `ConstraintSearch::max_nodes`, default 1 000 000, checked at every node |
 | Past it | reports no result; caller falls back to Monte Carlo |
 | Monte Carlo | bounded too, and bails after `max_attempts / 10` with zero valid samples |
+| The fallback | **the open problem** — see *What is left* below |
 | Offline | `ConstraintSearch::exhaustive()` removes the bound |
 | Worst measured solve | ~12 ms, boards up to 200 a side |
 
@@ -199,15 +200,55 @@ exactly the subtree that runs away.
 
 ## What is left
 
-Decomposition cannot help when a single group is too large to enumerate. The next
-step there is a dynamic program over the search frontier: merge partial
-assignments that agree on the cells still in play and on how many mines they have
-used, instead of walking each to a leaf. That is polynomial where the border is
-thin, which it usually is, and it would subsume decomposition rather than replace
-it — disconnected groups are just frontiers that never meet.
+### The requirement
 
-Whatever replaces it must keep the same two guarantees: **bounded work**, and **no
-0.0 or 1.0 that is not proven**.
+**Every probability the estimator reports must be the true one.** Not only the
+0.0 and the 1.0 — all of them. A number a player reads off a cell is a claim
+about how the board actually is, and an approximation that looks the same as an
+exact answer is a wrong claim dressed as a right one.
+
+Monte Carlo does not meet that bar and is not the goal. It is a stopgap for
+positions the exact search refuses, and while it is there the honest position is
+that a caller must be able to tell which kind of answer it received. Today it
+cannot: `calculate_mine_probabilities` returns a bare `Vec<Vec<f64>>` and the
+sampled numbers are indistinguishable from the exact ones. That is the gap to
+close, in the API and in every front-end that displays the result.
+
+Exact counting of consistent layouts is #P-hard, so *exact always* and *fast
+always* cannot both be promised in the worst case. The way to hold the
+requirement anyway is:
+
+1. make the exact method cover so much that the refusal is vanishingly rare, and
+2. when it does refuse, **say so** — never substitute a sample and present it as
+   the answer.
+
+### What that costs today
+
+Measured on 30x30/250, playing with `certain_cells` and opening the lowest cell
+when propagation runs dry: 663 solves, **3 refused by the node budget (0.5%)**.
+Each of those is solvable exactly — they need 1.2M to 3.8M nodes against the 1M
+budget, and cost 86 ms, 86 ms and 251 ms with the budget removed. One position
+found in an earlier sweep needed 10M nodes and 540 ms.
+
+So the refusals are not intractable positions. They are positions a few times
+past an arbitrary line, and the exact answer is a few hundred milliseconds away.
+Note the shipped page falls back more often than 0.5% on that board, because it
+plays differently and reuses a warm cache; measure the configuration you care
+about before tuning to it.
+
+### The next step
+
+A dynamic program over the search frontier: merge partial assignments that agree
+on the cells still in play and on how many mines they have used, instead of
+walking each to a leaf. It is exact — it counts the same layouts, it just stops
+re-deriving shared suffixes — and polynomial where the border is thin, which it
+usually is. It would subsume decomposition rather than replace it, since
+disconnected groups are just frontiers that never meet.
+
+Raising `max_nodes` is the cruder version of the same goal and buys most of the
+measured gap; it needs the work moved off the click first, the way the neural
+scoring pass already is, or a few hundred milliseconds lands on the main thread.
+
 
 ---
 
