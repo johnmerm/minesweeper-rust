@@ -1,133 +1,496 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <title>Rust Minesweeper</title>
-    <style>
-        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; background-color: #f0f0f0; }
-        .grid { display: grid; grid-template-columns: repeat({{ width }}, 30px); gap: 2px; background-color: #999; border: 5px solid #666; padding: 5px; }
-        .cell {
-            width: 30px; height: 30px;
-            display: flex; align-items: center; justify-content: center;
-            font-weight: bold; cursor: pointer;
-            text-decoration: none; color: black;
-            font-size: 18px;
-        }
-        .hidden { background-color: #ccc; border: 2px outset #eee; position: relative; }
-        .visible { background-color: #eee; border: 1px solid #999; }
-        .flagged { background-color: #ccc; border: 2px outset #eee; color: red; position: relative; }
-        .mine { background-color: red; color: white; }
-        .n1 { color: blue; }
-        .n2 { color: green; }
-        .n3 { color: red; }
-        .n4 { color: darkblue; }
-        .n5 { color: brown; }
-        .prob-label { position: absolute; bottom: 1px; right: 2px; font-size: 7px; color: #444; pointer-events: none; }
-        
-        .controls { margin-top: 20px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
-        
-        form { display: inline; margin: 0; padding: 0; }
-        button.cell-btn { width: 100%; height: 100%; border: none; background: transparent; padding: 0; font: inherit; cursor: pointer; }
-        #prob-status { margin-top: 8px; font-size: 14px; color: #555; min-height: 1.4em; }
-        .sim-stats { margin-top: 4px; font-size: 11px; line-height: 1.6; text-align: center; }
-        .sim-stats .mc { color: #888; }
-        .sim-stats .cs { color: #446; }
-    </style>
+<meta charset="utf-8">
+<!-- Markup and styles are docs/index.html's, so the two pages look the same; the
+     script below is docs/minesweeper.js's drawing code, driven over HTTP instead
+     of through the wasm ABI. Change one page and change the other. -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minesweeper — Rust / Actix-Web</title>
+<!-- Inline favicon: keeps the page to the three files it actually needs. -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23ccc'/%3E%3Ccircle cx='16' cy='16' r='8' fill='%23222'/%3E%3Cpath d='M16 2v6M16 24v6M2 16h6M24 16h6' stroke='%23222' stroke-width='3'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #f0f0f0;
+    --panel: #fff;
+    --ink: #222;
+    --muted: #777;
+    --frame: #999;
+    --cell: 30px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 20px 12px 40px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: flex; flex-direction: column; align-items: center;
+  }
+  h1 { font-size: 22px; margin: 0 0 2px; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+
+  .status { font-size: 18px; font-weight: 600; min-height: 1.4em; margin-bottom: 10px; }
+  .status.won  { color: #1a7f37; }
+  .status.lost { color: #c1121f; }
+
+  .scoreboard {
+    display: flex; gap: 18px; align-items: center; justify-content: center;
+    font-variant-numeric: tabular-nums; font-size: 15px; margin-bottom: 10px;
+  }
+  .scoreboard span { color: var(--muted); }
+  .scoreboard b { color: var(--ink); }
+
+  .grid {
+    display: grid; gap: 2px; padding: 5px;
+    background: var(--frame); border: 5px solid #666;
+    touch-action: manipulation;
+  }
+  .cell {
+    width: var(--cell); height: var(--cell);
+    display: flex; align-items: center; justify-content: center;
+    position: relative;
+    font-weight: bold; font-size: 17px; line-height: 1;
+    user-select: none; -webkit-user-select: none;
+    padding: 0; margin: 0; font-family: inherit;
+  }
+  .cell.hidden  { background: #ccc; border: 2px outset #eee; cursor: pointer; }
+  .cell.flagged { background: #ccc; border: 2px outset #eee; cursor: pointer; color: #c1121f; }
+  .cell.visible { background: #eee; border: 1px solid var(--frame); cursor: default; }
+  .cell.mine    { background: #e5383b; color: #fff; }
+  .cell.hidden:hover, .cell.flagged:hover { filter: brightness(1.08); }
+  .n1 { color: #0000ff; } .n2 { color: #007b00; } .n3 { color: #e00000; }
+  .n4 { color: #00007b; } .n5 { color: #7b0000; } .n6 { color: #008080; }
+  .n7 { color: #000; }    .n8 { color: #808080; }
+  .prob {
+    position: absolute; bottom: 0; right: 2px;
+    font-size: 8px; font-weight: 600; color: #444;
+    pointer-events: none; letter-spacing: -0.3px;
+  }
+  /* The network's guess, kept visually subordinate to the exact value: it is an
+     approximation of the number in the other corner, not a second opinion of
+     equal standing. */
+  .guess {
+    position: absolute; top: 0; left: 2px;
+    font-size: 8px; font-weight: 600; color: #6a4fb6;
+    pointer-events: none; letter-spacing: -0.3px;
+  }
+  .grid.no-prob .prob, .grid.no-prob .guess { display: none; }
+  .grid:not(.show-neural) .guess, .grid:not(.show-exact) .prob { display: none; }
+  /* Nothing to sit beside, so it takes the usual corner and the usual weight. */
+  .grid.show-neural:not(.show-exact) .guess {
+    top: auto; left: auto; bottom: 0; right: 2px;
+  }
+  .neural-note { margin-top: 2px; font-size: 11px; color: #6a4fb6; min-height: 1.3em; }
+
+  #hover { margin-top: 10px; font-size: 14px; color: #555; min-height: 1.4em; }
+  .sim { margin-top: 2px; font-size: 11px; line-height: 1.6; text-align: center; color: #888; }
+  .sim .used { color: #335; font-weight: 600; }
+  .sim .unsolved { color: #a3521b; font-weight: 600; }
+
+  .panel {
+    margin-top: 16px; padding: 12px 16px;
+    background: var(--panel); border: 1px solid #ddd; border-radius: 8px;
+    display: flex; flex-wrap: wrap; gap: 10px 14px;
+    align-items: center; justify-content: center; max-width: 640px;
+  }
+  .panel label { font-size: 13px; display: inline-flex; align-items: center; gap: 4px; }
+  .panel input[type=number] { width: 54px; font: inherit; font-size: 13px; padding: 3px; }
+  .panel select { font: inherit; font-size: 13px; padding: 3px; }
+  button {
+    font: inherit; font-size: 14px; padding: 6px 14px; cursor: pointer;
+    border: 1px solid #bbb; border-radius: 6px; background: #fafafa;
+  }
+  button:hover { background: #f0f0f0; }
+  button.on { background: #c8f0c8; border-color: #8cc98c; }
+  .preset { padding: 4px 10px; font-size: 13px; }
+  .hint { margin-top: 14px; font-size: 12px; color: var(--muted); text-align: center; }
+  .hint code { background: #e6e6e6; padding: 1px 4px; border-radius: 3px; }
+  .build { margin: 4px 0 0; font-size: 11px; color: #aaa; font-variant-numeric: tabular-nums; }
+  #error { color: #c1121f; font-size: 14px; max-width: 520px; text-align: center; }
+</style>
 </head>
 <body>
-    <h1>Minesweeper</h1>
-    
-    {% if state == "Won" %}
-        <h2 style="color: green">YOU WON!</h2>
-    {% elif state == "Lost" %}
-        <h2 style="color: red">GAME OVER</h2>
-    {% else %}
-        <h2>Mines: {{ mines_count }}</h2>
-    {% endif %}
+<h1>Minesweeper</h1>
+<div class="subtitle">Rust engine on an Actix-Web server &middot; the solver and the network run server-side</div>
+<div id="error" hidden></div>
+<div class="status" id="status">Loading…</div>
+<div class="scoreboard">
+  <div><span>Mines</span> <b id="mines-left">–</b></div>
+  <div><span>Time</span> <b id="timer">0:00</b></div>
+</div>
+<div class="grid" id="grid" oncontextmenu="return false"></div>
+<div id="hover"></div>
+<div class="sim" id="sim"></div>
+<div class="neural-note" id="neural-note"></div>
+<div class="panel">
+  <label>W <input type="number" id="in-width"  value="10" min="3" max="200"></label>
+  <label>H <input type="number" id="in-height" value="10" min="3" max="200"></label>
+  <label>Mines <input type="number" id="in-mines" value="10" min="1" max="39999"></label>
+  <button id="btn-new">New game</button>
+  <button class="preset" data-w="9"  data-h="9"  data-m="10">Beginner</button>
+  <button class="preset" data-w="16" data-h="16" data-m="40">Intermediate</button>
+  <button class="preset" data-w="30" data-h="16" data-m="99">Expert</button>
+</div>
+<div class="panel">
+  <button id="btn-probs" class="on">Show probabilities</button>
+  <button id="btn-auto">Auto-play deductions</button>
+  <button id="btn-flagmode">Flag mode</button>
+  <label>Show
+    <select id="in-show">
+      <option value="0">Both estimates</option>
+      <option value="1">Constraint search only</option>
+      <option value="2">Neural network only</option>
+    </select>
+  </label>
+</div>
+<p class="hint">
+  Left click reveals &middot; right click (or <em>flag mode</em>) flags.<br>
+  Cells are tinted from grey to red by the estimated chance they hide a mine.<br>
+  Every percentage is exact — the fraction of consistent mine layouts with a mine there. If the search cannot finish, the cells read <em>?</em> rather than a guess.<br>
+  <em>Show</em> picks which estimate you see: the solver's proof, the network's guess (purple), or both — the guess in the top-left of each cell, the proof in the bottom-right.<br>
+  <em>Auto-play deductions</em> opens every cell proven safe and flags every cell proven to be a mine. On <em>neural network only</em> it follows the network instead, opening under 5% and flagging over 95% — which is how you find out what the network is worth, and it will eventually open a mine.
+</p>
+<p class="hint">The game lives on the server: every tab open on it shows the same board.</p>
+<script>var INITIAL_STATE = {{ initial | safe }};</script>
+{% raw %}
+<script>
+(function () {
+  'use strict';
 
-    <div class="grid">
-        {% for row in grid %}
-            {% set y = loop.index0 %}
-            {% for cell in row %}
-                {% set x = loop.index0 %}
-                
-                {% if cell.state == "Hidden" %}
-                    <div class="cell hidden" style="background-color: {{ cell.prob_color }};" title="Mine: {{ cell.prob_pct }}">
-                         <form action="/reveal" method="post" style="width: 100%; height: 100%;">
-                             <input type="hidden" name="x" value="{{ x }}">
-                             <input type="hidden" name="y" value="{{ y }}">
-                             <button type="submit" class="cell-btn" oncontextmenu="event.preventDefault(); document.getElementById('flag-{{x}}-{{y}}').submit(); return false;"></button>
-                         </form>
-                         <form id="flag-{{x}}-{{y}}" action="/flag" method="post" style="display:none;">
-                             <input type="hidden" name="x" value="{{ x }}">
-                             <input type="hidden" name="y" value="{{ y }}">
-                         </form>
-                         <span class="prob-label">{{ cell.prob_pct }}</span>
-                    </div>
-                {% elif cell.state == "Flagged" %}
-                    <div class="cell flagged" style="background-color: {{ cell.prob_color }};" title="Mine: {{ cell.prob_pct }}" oncontextmenu="event.preventDefault(); document.getElementById('flag-{{x}}-{{y}}').submit(); return false;">
-                        F
-                        <form id="flag-{{x}}-{{y}}" action="/flag" method="post" style="display:none;">
-                             <input type="hidden" name="x" value="{{ x }}">
-                             <input type="hidden" name="y" value="{{ y }}">
-                         </form>
-                         <span class="prob-label">{{ cell.prob_pct }}</span>
-                    </div>
-                {% else %}
-                    <!-- Visible -->
-                    {% if cell.content == "Mine" %}
-                        <div class="cell visible mine">*</div>
-                    {% elif cell.content == 0 %}
-                         <div class="cell visible"></div>
-                    {% else %}
-                         <div class="cell visible n{{ cell.content }}">{{ cell.content }}</div>
-                    {% endif %}
-                {% endif %}
-            {% endfor %}
-        {% endfor %}
-    </div>
+  var VISIBLE_MINE = 9, HIDDEN = 10, FLAGGED = 11;
+  var SHOW_BOTH = 0, SHOW_EXACT = 1, SHOW_NEURAL = 2;
+  /** How often to ask again while the server says more is coming. */
+  var POLL_MS = 150;
 
-    <div id="prob-status"></div>
+  var S = null;              // the last state the server sent
+  var receivedAt = 0;        // when, for the clock
+  var cellEls = [], painted = [];
+  var width = 0, height = 0;
+  var showProbs = true, flagMode = false;   // how this tab draws; not the server's business
+  var pollTimer = 0, clockTimer = 0;
+  var hoverIndex = -1;
 
-    <div class="sim-stats">
-        <div class="cs">{{ status }}</div>
-    </div>
+  var el = {
+    grid: document.getElementById('grid'),
+    status: document.getElementById('status'),
+    minesLeft: document.getElementById('mines-left'),
+    timer: document.getElementById('timer'),
+    hover: document.getElementById('hover'),
+    sim: document.getElementById('sim'),
+    error: document.getElementById('error'),
+    width: document.getElementById('in-width'),
+    height: document.getElementById('in-height'),
+    mines: document.getElementById('in-mines'),
+    neuralNote: document.getElementById('neural-note'),
+    show: document.getElementById('in-show'),
+    auto: document.getElementById('btn-auto')
+  };
 
-    <div class="controls">
-        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap; justify-content:center; margin-bottom:8px;">
-            <form action="/new" method="post" style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:center;">
-                <label style="font-size:13px;">W:
-                    <input type="number" name="width"  value="{{ settings_width  }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
-                </label>
-                <label style="font-size:13px;">H:
-                    <input type="number" name="height" value="{{ settings_height }}" min="3" max="50"  style="width:46px; font-size:13px; padding:2px;">
-                </label>
-                <label style="font-size:13px;">Mines:
-                    <input type="number" name="mines"  value="{{ settings_mines  }}" min="1" max="999" style="width:52px; font-size:13px; padding:2px;">
-                </label>
-                <button type="submit">New Game</button>
-            </form>
-            <form action="/toggle-auto-reveal" method="post" style="display:inline;">
-                <button type="submit" style="{% if auto_reveal %}background:#c8f0c8;{% endif %}">
-                    Auto-reveal safe cells: {{ auto_reveal }}
-                </button>
-            </form>
-        </div>
-    </div>
+  /* ------------------------------------------------------------ talking */
 
-    <p style="font-size:12px; color:#777;">Left click to reveal · Right click to flag</p>
+  function fail(err) {
+    el.error.hidden = false;
+    el.error.textContent = 'Lost the server: ' + err.message + '. Is `cargo run -p web` still running?';
+    if (window.console) console.error(err);
+  }
 
-    <script>
-        document.querySelectorAll('.cell.hidden, .cell.flagged').forEach(function(cell) {
-            cell.addEventListener('mouseenter', function() {
-                var pct = cell.title.replace('Mine: ', '');
-                if (pct) document.getElementById('prob-status').textContent = 'Mine probability: ' + pct;
-            });
-            cell.addEventListener('mouseleave', function() {
-                document.getElementById('prob-status').textContent = '';
-            });
-        });
-    </script>
+  function post(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + path);
+      return r.json();
+    }).then(receive, fail);
+  }
+
+  /** Ask for whatever has changed since the last answer, while anything is pending. */
+  function poll() {
+    pollTimer = 0;
+    fetch('/state?since=' + S.revision).then(function (r) {
+      if (r.status === 204) return null;
+      if (!r.ok) throw new Error('HTTP ' + r.status + ' from /state');
+      return r.json();
+    }).then(function (state) {
+      if (state) receive(state);
+      else schedulePoll();
+    }, fail);
+  }
+
+  function schedulePoll() {
+    if (!pollTimer && S && S.busy) pollTimer = setTimeout(poll, POLL_MS);
+  }
+
+  function receive(state) {
+    el.error.hidden = true;
+    S = state;
+    receivedAt = Date.now();
+    if (state.width !== width || state.height !== height) buildGrid();
+    el.show.value = String(state.show);
+    el.auto.classList.toggle('on', state.auto_play);
+    render();
+    renderSim();
+    el.neuralNote.textContent = describeNeural();
+    showHover();
+    tickClock();
+    schedulePoll();
+  }
+
+  /* ---------------------------------------------------------- rendering */
+
+  function buildGrid() {
+    width = S.width;
+    height = S.height;
+    el.width.value = width;
+    el.height.value = height;
+    el.mines.value = S.mines;
+    el.grid.style.gridTemplateColumns = 'repeat(' + width + ', var(--cell))';
+    el.grid.textContent = '';
+    cellEls = new Array(width * height);
+    painted = new Array(width * height);
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < width * height; i++) {
+      var cell = document.createElement('div');
+      cell.className = 'cell hidden';
+      cell.dataset.i = i;
+      var label = document.createElement('span');
+      label.className = 'prob';
+      cell.appendChild(label);
+      var guess = document.createElement('span');
+      guess.className = 'guess';
+      cell.appendChild(guess);
+      cellEls[i] = cell;
+      frag.appendChild(cell);
+    }
+    el.grid.appendChild(frag);
+    hoverIndex = -1;
+  }
+
+  /** A cell on a board the solver could not finish. Deliberately not the grey
+   *  that probColor(0) produces, which is what "certainly safe" looks like. */
+  var UNKNOWN = 'rgb(198,203,214)';
+
+  /** Grey → red tint, matching the CLI, Qt and wasm front-ends. */
+  function probColor(p) {
+    var r = Math.round(204 + 51 * p);
+    var gb = Math.round(204 * (1 - p));
+    return 'rgb(' + r + ',' + gb + ',' + gb + ')';
+  }
+
+  function solved() { return !!(S.exact && S.exact.solved); }
+
+  function render() {
+    var c = S.cells;
+    var known = solved(), calculating = !S.exact;
+    var p = known ? S.exact.probs : null;
+    var g = S.neural.on ? S.neural.probs : null;
+    var exact = S.show !== SHOW_NEURAL;
+    var over = S.state !== 0;
+
+    for (var i = 0; i < cellEls.length; i++) {
+      var code = c[i];
+      var text = '', cls = 'cell', bg = '', pct = '';
+      if (code === HIDDEN || code === FLAGGED) {
+        cls += code === FLAGGED ? ' flagged' : ' hidden';
+        text = code === FLAGGED ? '⚑' : '';
+        // Exact tint once solved; the refusal tint once refused; while the solve
+        // is still running, plain grey — never the last board's colours.
+        var tint = exact ? (known ? p[i] : -1) : (g && g[i] >= 0 ? g[i] : -1);
+        bg = tint >= 0 ? probColor(tint) : (exact && !known && !calculating ? UNKNOWN : '');
+        pct = exact ? (known ? Math.round(p[i] * 100) + '%' : (calculating ? '' : '?')) : '';
+      } else if (code === VISIBLE_MINE) {
+        cls += ' visible mine';
+        text = '✹';
+      } else {
+        cls += ' visible' + (code > 0 ? ' n' + code : '');
+        text = code > 0 ? String(code) : '';
+      }
+      var guessed = '';
+      if (g && !over && (code === HIDDEN || code === FLAGGED) && g[i] >= 0) {
+        guessed = Math.round(g[i] * 100) + '%';
+      }
+
+      var shown = cls + '\u0000' + bg + '\u0000' + text + '\u0000' + (over ? '' : pct) +
+                  '\u0000' + guessed;
+      if (painted[i] === shown) continue;
+      painted[i] = shown;
+
+      var node = cellEls[i], guessLabel = node.lastChild, label = guessLabel.previousSibling;
+      guessLabel.textContent = guessed;
+      node.className = cls;
+      node.style.backgroundColor = bg;
+      node.title = pct
+        ? 'Mine: ' + pct + (guessed ? '  network: ' + guessed : '')
+        : (guessed ? 'Network: ' + guessed : '');
+      if (node.firstChild !== label && node.firstChild !== guessLabel) {
+        node.removeChild(node.firstChild);
+      }
+      if (text) node.insertBefore(document.createTextNode(text), label);
+      label.textContent = over ? '' : pct;
+    }
+    el.grid.classList.toggle('no-prob', !showProbs);
+    el.grid.classList.toggle('show-exact', exact);
+    el.grid.classList.toggle('show-neural', !!g);
+
+    el.status.className = 'status' + (S.state === 1 ? ' won' : S.state === 2 ? ' lost' : '');
+    el.status.textContent = S.state === 1 ? 'You won!' : S.state === 2 ? 'Boom — game over' : 'Playing';
+    el.minesLeft.textContent = S.mines - S.flags;
+  }
+
+  function formatBytes(b) {
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+    return (b / 1048576).toFixed(1) + ' MB';
+  }
+
+  function renderSim() {
+    var e = S.exact;
+    if (!e) {
+      el.sim.textContent = 'calculating…';
+      return;
+    }
+    var div = document.createElement('div');
+    if (e.solved) {
+      var looked = e.cache_hits + e.cache_misses;
+      div.className = 'used';
+      div.textContent = 'exact: ' + e.layouts.toLocaleString() + ' region layouts / ' +
+          e.nodes.toLocaleString() + ' nodes [' + formatBytes(e.memory_bytes) + ']' +
+          (looked ? ' · ' + Math.round(100 * e.cache_hits / looked) + '% reused' : '');
+    } else {
+      div.className = 'unsolved';
+      div.textContent = 'no exact answer within ' + e.nodes.toLocaleString() +
+          ' nodes — showing none rather than guessing';
+    }
+    el.sim.textContent = '';
+    el.sim.appendChild(div);
+  }
+
+  function describeNeural() {
+    var n = S.neural;
+    if (n.broken) return 'network: this build carries no usable weights';
+    if (n.held_back) return 'network: not scored automatically on a board this large — pick a mode to ask for it';
+    if (!n.on) return '';
+    if (!n.total) return 'network: …';
+    var done = n.total - n.remaining;
+    var text = n.remaining > 0
+      ? 'network: ' + done.toLocaleString() + ' / ' + n.total.toLocaleString() + ' cells…'
+      : 'network: ' + n.total.toLocaleString() + ' cells';
+    if (n.error !== null) {
+      text += ' · off by ' + (n.error * 100).toFixed(1) + ' points, corrected';
+    } else if (S.show === SHOW_NEURAL) {
+      text += ' · uncorrected';
+    }
+    if (n.opened || n.flagged) {
+      text += ' · it has opened ' + n.opened + ' and flagged ' + n.flagged;
+      if (S.state === 2) text += ', then hit a mine';
+      if (S.state === 1) text += ', and won';
+    }
+    if (n.stuck) text += ' · nothing it is sure enough about';
+    return text;
+  }
+
+  /** The line under the board, re-read whenever new numbers arrive, not only on entry. */
+  function showHover() {
+    var i = hoverIndex;
+    var c = i >= 0 ? S.cells[i] : -1;
+    if (c !== HIDDEN && c !== FLAGGED) {
+      el.hover.textContent = '';
+      return;
+    }
+    var parts = [];
+    if (S.show !== SHOW_NEURAL) {
+      parts.push(!S.exact ? 'Mine probability: calculating…'
+        : S.exact.solved ? 'Mine probability: ' + (S.exact.probs[i] * 100).toFixed(1) + '%'
+        : 'Mine probability: not known — the search did not finish');
+    }
+    if (S.neural.on) {
+      var guess = S.neural.probs[i];
+      parts.push('network: ' + (guess >= 0 ? (guess * 100).toFixed(1) + '%' : '…'));
+    }
+    el.hover.textContent = parts.join(' · ');
+  }
+
+  /* -------------------------------------------------------------- clock */
+
+  /** The server keeps the time; the page only counts on from its last word. */
+  function tickClock() {
+    var ms = S.elapsed_ms + (S.timing ? Date.now() - receivedAt : 0);
+    var secs = Math.floor(ms / 1000);
+    el.timer.textContent = Math.floor(secs / 60) + ':' + String(secs % 60).padStart(2, '0');
+    if (S.timing && !clockTimer) {
+      clockTimer = setInterval(tickClock, 500);
+    } else if (!S.timing && clockTimer) {
+      clearInterval(clockTimer);
+      clockTimer = 0;
+    }
+  }
+
+  /* ------------------------------------------------------------- events */
+
+  function onCell(index, flag) {
+    if (!S || S.state !== 0) return;
+    var x = index % width, y = Math.floor(index / width);
+    if (!flag && S.cells[index] === FLAGGED) return; // never blow up a flagged cell
+    post(flag ? '/flag' : '/reveal', { x: x, y: y });
+  }
+
+  function cellIndexFrom(target) {
+    var node = target.closest ? target.closest('.cell') : null;
+    return node ? Number(node.dataset.i) : -1;
+  }
+
+  function newGame(w, h, m) {
+    post('/new', { width: Math.max(0, w | 0), height: Math.max(0, h | 0), mines: Math.max(0, m | 0) });
+  }
+
+  el.grid.addEventListener('click', function (e) {
+    var i = cellIndexFrom(e.target);
+    if (i >= 0) onCell(i, flagMode);
+  });
+  el.grid.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    var i = cellIndexFrom(e.target);
+    if (i >= 0) onCell(i, true);
+  });
+  el.grid.addEventListener('mouseover', function (e) {
+    hoverIndex = cellIndexFrom(e.target);
+    if (S) showHover();
+  });
+  el.grid.addEventListener('mouseleave', function () {
+    hoverIndex = -1;
+    el.hover.textContent = '';
+  });
+
+  document.getElementById('btn-new').addEventListener('click', function () {
+    newGame(Number(el.width.value), Number(el.height.value), Number(el.mines.value));
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.preset'), function (btn) {
+    btn.addEventListener('click', function () {
+      newGame(Number(btn.dataset.w), Number(btn.dataset.h), Number(btn.dataset.m));
+    });
+  });
+  var probsBtn = document.getElementById('btn-probs');
+  probsBtn.addEventListener('click', function () {
+    showProbs = !showProbs;
+    probsBtn.classList.toggle('on', showProbs);
+    el.grid.classList.toggle('no-prob', !showProbs);
+  });
+  el.auto.addEventListener('click', function () {
+    post('/settings', { auto_play: !S.auto_play });
+  });
+  var flagBtn = document.getElementById('btn-flagmode');
+  flagBtn.addEventListener('click', function () {
+    flagMode = !flagMode;
+    flagBtn.classList.toggle('on', flagMode);
+  });
+  el.show.addEventListener('change', function () {
+    post('/settings', { show: Number(el.show.value) });
+  });
+
+  if (INITIAL_STATE) receive(INITIAL_STATE);
+  else fetch('/state').then(function (r) { return r.json(); }).then(receive, fail);
+})();
+</script>
+{% endraw %}
 </body>
 </html>

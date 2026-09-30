@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Minesweeper — console in the browser</title>
+<!-- The real `cli` binary, on a pseudo-terminal on the server, drawn by xterm.js.
+     See web/src/terminal.rs for what the server will and will not run. -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+<style>
+  :root { --bg: #f0f0f0; --ink: #222; --muted: #777; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; padding: 16px 12px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  .subtitle { font-size: 12px; color: var(--muted); }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center; }
+  button {
+    font: inherit; font-size: 13px; padding: 4px 10px; cursor: pointer;
+    border: 1px solid #bbb; border-radius: 6px; background: #fafafa;
+  }
+  button:hover { background: #f0f0f0; }
+  #state { font-size: 13px; color: var(--muted); min-width: 12em; text-align: center; }
+  #state.error { color: #c1121f; }
+  #screen {
+    flex: 1; width: min(100%, 1200px); min-height: 300px;
+    background: #1e1e1e; border: 5px solid #666; border-radius: 4px; padding: 6px;
+  }
+  .hint { font-size: 12px; color: var(--muted); text-align: center; margin: 0; }
+  .hint a { color: inherit; }
+</style>
+</head>
+<body>
+<h1>Minesweeper</h1>
+<div class="subtitle">The terminal front-end, running on the server, in your browser</div>
+<div class="bar">
+  <button data-board="">Restart</button>
+  <button data-board="9,9,10">Beginner</button>
+  <button data-board="16,16,40">Intermediate</button>
+  <button data-board="30,16,99">Expert</button>
+  <span id="state">connecting…</span>
+</div>
+<div id="screen"></div>
+<p class="hint">Click the terminal, then play with the keyboard — the key list is at its foot.
+  <a href="/">Mouse version</a> · <a href="/wasm/">WebAssembly version</a></p>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+{% raw %}
+<script>
+(function () {
+  'use strict';
+  var state = document.getElementById('state');
+  function say(text, error) {
+    state.textContent = text;
+    state.className = error ? 'error' : '';
+  }
+  if (typeof Terminal === 'undefined' || typeof FitAddon === 'undefined') {
+    say('could not load xterm.js from cdn.jsdelivr.net', true);
+    return;
+  }
+
+  var term = new Terminal({
+    fontFamily: 'ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", Menlo, monospace',
+    fontSize: 15,
+    cursorBlink: false,
+    theme: { background: '#1e1e1e' }
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('screen'));
+  fit.fit();
+
+  var socket = null;
+  var encoder = new TextEncoder();
+
+  /** One console per connection: a new board is a new process. */
+  function connect(board) {
+    if (socket) {
+      socket.onclose = null;
+      socket.close();
+    }
+    term.reset();
+    say('connecting…');
+    var url = new URL('/terminal/ws', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    url.searchParams.set('cols', term.cols);
+    url.searchParams.set('rows', term.rows);
+    if (board) {
+      var parts = board.split(',');
+      url.searchParams.set('width', parts[0]);
+      url.searchParams.set('height', parts[1]);
+      url.searchParams.set('mines', parts[2]);
+    }
+    socket = new WebSocket(url);
+    socket.binaryType = 'arraybuffer';
+    socket.onopen = function () {
+      say('connected');
+      term.focus();
+    };
+    socket.onmessage = function (event) {
+      term.write(new Uint8Array(event.data));
+    };
+    socket.onerror = function () {
+      // The handshake's refusal text is not exposed to scripts; fetch it, since
+      // it says what to do (build the cli, close a tab…).
+      fetch(url.href.replace(/^ws/, 'http')).then(function (r) { return r.text(); })
+        .then(function (text) { say(text || 'connection failed', true); },
+              function () { say('the server is not answering', true); });
+    };
+    socket.onclose = function (event) {
+      if (state.className !== 'error') say(event.wasClean ? 'the console exited — Restart for another' : 'disconnected');
+    };
+  }
+
+  term.onData(function (data) {
+    if (socket && socket.readyState === WebSocket.OPEN) socket.send(encoder.encode(data));
+  });
+  term.onResize(function (size) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ cols: size.cols, rows: size.rows }));
+    }
+  });
+  window.addEventListener('resize', function () { fit.fit(); });
+
+  Array.prototype.forEach.call(document.querySelectorAll('[data-board]'), function (button) {
+    button.addEventListener('click', function () { connect(button.dataset.board); });
+  });
+  connect('');
+})();
+</script>
+{% endraw %}
+</body>
+</html>

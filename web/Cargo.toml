@@ -7,5 +7,10 @@ rust-version.workspace = true
 [dependencies]
 minesweeper_core = { path = "../minesweeper_core" }
 actix-web = "4"
+actix-files = "0.6"
 tera = "1"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
+actix-ws = "0.4.0"
+portable-pty = "0.9.0"
+tokio = { version = "1", features = ["sync"] }

@@ -46,6 +46,8 @@ The single source of truth for all game state and logic.
 | `Minesweeper::reveal` | Reveals a cell; generates mines lazily on the first call (safe-first-click guarantee) |
 | `Minesweeper::toggle_flag` | Cycles `Hidden ↔ Flagged` |
 | `Minesweeper::calculate_mine_probabilities` | Exact probability estimator – see below |
+| `session::run` | The worker thread every threaded front-end uses: owns the `ConstraintSearch` and the `PatchCnn`, takes a `Job` per move, answers with `Reply`s |
+| `session::Controller` | One game driven through that thread: which replies are stale, when the network is corrected and when it plays, the clock |
 
 #### Mine probability estimator
 
@@ -100,31 +102,69 @@ rather than an error. `minesweeper_core/tests/neural.rs` catches the drift.
 
 ### `cli`
 
-Terminal front-end using **crossterm 0.27**.
+Terminal front-end using **crossterm 0.27**, on the same `session::Controller`
+as the Qt GUI and the web server, so a key never waits on a solve.
 
-- Arrow keys move a cursor; `Space` reveals; `F` flags; `Q` quits.
-- Probabilities are recomputed (via `calculate_mine_probabilities`) after every reveal or flag action.
-- Unopened cells are coloured with an RGB background interpolated from grey `(204,204,204)` to red `(255,0,0)` based on mine probability.
-- The status line below the grid shows the probability for the cell under the cursor.
+- Arrows or `hjkl` move; `Space`/`Enter` reveals; `F` flags; `N` new game;
+  `1`/`2`/`3` the three presets; `A` auto-play; `S` cycles *Show*; `P` toggles
+  labels; `Q` quits. `cli W H M` sets the opening board.
+- The loop polls keys every 50 ms, drains the session's replies, and redraws only
+  when something changed — overwriting lines in place, since the network reports
+  several times a second and a full clear per report flickers.
+- A terminal cell holds one label, so each square shows the estimate the tint
+  follows, and the line under the board gives both for the cursor's cell.
+- Boards larger than the terminal scroll to follow the cursor.
 
 ### `gui`
 
-Desktop front-end using **qmetaobject 0.2** (Qt 5 bindings) with an inline QML UI.
+Desktop front-end using **qmetaobject 0.2** (Qt 5 bindings). It mirrors the page
+in `docs/` — same controls, same colours, same wording — so a change to one
+front-end's behaviour is a change to make in the other.
 
-- Left-click reveals; right-click flags.
-- `MinesweeperGui::update_view` converts the board + probabilities into a `QVariantList` of maps consumed by a QML `Repeater`.
-- Each cell map carries: `text`, `color`, `bgColor` (probability-tinted for unopened cells), `probText` (e.g. `"23%"`).
-- Hovering a cell updates the `hoveredProb` QML property, which replaces the mine-count in the status `Text` element.
+- `src/main.qml` is the UI, pulled in with `include_str!`; `src/main.rs` is the
+  `MinesweeperGui` object behind it. Everything slow is `minesweeper_core::session`.
+- **One `session::run` thread for the life of the window**, not one per move. It
+  owns the `ConstraintSearch` (whose component cache only pays off if the
+  instance survives between moves, exactly as in the wasm `AppState`) and the
+  `PatchCnn`, which corrects itself as it scores. `session::Controller` sends a
+  `Job` after every move; replies come back on the Qt thread through
+  `queued_callback`, so nothing polls.
+- Every job and reply carries a `generation`. A reply about an older board is
+  dropped, and a newer job interrupts a scoring pass in progress.
+- Cells are a `SimpleListModel<CellView>` in a `GridView`. `repaint` compares
+  each cell against `painted` and calls `change_line` only for the ones that
+  changed; the model is reset only when the board changes shape.
+- The network is the core's `PatchCnn` with `neural/onnx/model.bin` compiled in,
+  like the wasm build — not the `tract`/ONNX `NeuralNetwork`, so it needs no
+  feature flag and no model file at run time.
+- The page's rules carry over unchanged: an unsolved board shows `?` on the
+  `UNKNOWN` tint, never a stale or zero tint; unscored cells hold `NOT_SCORED`;
+  the network is corrected only after an exact solve and never in *Neural network
+  only*; proof auto-play (`session::auto_reveal`) and the network's
+  (`session::neural_auto`) are separate functions that are never confused.
 
 ### `web`
 
-Web front-end using **Actix-Web 4** with **Tera** templates.
+Web front-end using **Actix-Web 4** with **Tera** templates. One process serves
+three things:
 
-- Single shared `Mutex<Minesweeper>` in `AppState`.
-- `GET /` renders the board; `POST /reveal`, `POST /flag`, `POST /new` mutate state and redirect back.
-- The index handler builds `Vec<Vec<CellView>>` (which includes `prob_color` and `prob_pct` per cell) and passes it to `index.html` as `grid`.
-- The template renders inline `background-color` CSS and `title` tooltip attributes from those fields.
-- A small `<span class="prob-label">` shows the percentage inside each unopened cell; a JS snippet drives a status bar that updates on hover.
+- **`/`** — the server-side game. One `session::Controller` behind a mutex, shared
+  by every tab. The page (`templates/index.html`) is `docs/index.html`'s markup and
+  CSS with `docs/minesweeper.js`'s drawing code, driven over HTTP instead of the
+  wasm ABI: moves are `POST /reveal`, `/flag`, `/new`, `/settings` as JSON, each
+  answering with the whole board, and while `busy` the page polls
+  `GET /state?since=<revision>`, which answers `204` when nothing changed. Change
+  either page and change the other. Cells use the wasm crate's byte encoding.
+  An unsolved board sends `solved: false` and an empty `probs` — never zeros.
+- **`/wasm/`** — `docs/` as a static site, read from disk per request so a
+  `./wasm/build.sh` shows up on reload. `web --wasm` serves only that, on port
+  8081, so the two can run side by side.
+- **`/terminal`** — the `cli` binary itself, on a pseudo-terminal per tab, drawn by
+  xterm.js over a WebSocket (`src/terminal.rs`). It runs only the `cli` built
+  beside the server, never a shell; the browser chooses nothing but a board size,
+  parsed as numbers; the handshake is refused unless `Origin` is this server,
+  because a WebSocket is not covered by the same-origin policy; at most eight
+  run at once; and a closed tab kills its process. Keep all of that if you touch it.
 
 #### Independent regions
 
@@ -230,7 +270,9 @@ cargo build
 # Run individual front-ends
 cargo run -p cli
 cargo run -p gui
-cargo run -p web   # serves http://127.0.0.1:8080
+cargo run -p web   # serves http://127.0.0.1:8080 (/, /wasm/, /terminal)
+cargo run -p web -- --wasm   # only the WebAssembly site, on :8081
+cargo build -p cli # /terminal runs this binary; build it first
 
 # WebAssembly front-end: build the module and refresh docs/
 rustup target add wasm32-unknown-unknown   # once
@@ -238,7 +280,11 @@ rustup target add wasm32-unknown-unknown   # once
 python3 -m http.server -d docs 8000        # then open http://localhost:8000/
 ```
 
-The workspace uses **resolver = "2"**. `cargo build` is the baseline check. The
+The workspace uses **resolver = "3"** with `rust-version` pinned, so dependencies
+resolve to versions the pinned toolchain can build — a crate that needs a newer
+compiler is refused rather than picked. `minesweeper_core` is optimised even in
+debug builds (`[profile.dev.package.minesweeper_core]`): unoptimised, the network
+takes 128 s to score an Expert board, against 2.4 s. `cargo build` is the baseline check. The
 only automated test is `node wasm/smoke.mjs`, which exercises the built
 `docs/minesweeper.wasm` through the same ABI the page uses (no npm install
 required); run it after `./wasm/build.sh`.
@@ -341,11 +387,15 @@ That, not a bigger budget, is what closes the remaining few percent.
   consult a full solve only once propagation has run dry. Re-solving after each
   pass is what made one click take 31 seconds. Only ever act on a *proven* 0% —
   the exact search's, never sampling's.
-- **GUI**: `update_view` renders immediately with the cached probabilities, then spawns one
-  thread per strategy, all sending on a shared `mpsc` channel. A QML `Timer` calls
-  `check_prob_update` every 100 ms to drain it, so the Qt event loop never waits on a
-  solve. Emit `board_changed` after any state change; QML reaches it as `onBoard_changed`
-  (Qt capitalises the first letter — `onboard_changed` silently never fires).
+- **GUI**: nothing slow runs on the Qt thread — send it to the worker as part of a
+  `Job`. Emit `board_changed` only when the board's shape changes (QML resizes the
+  window on it, as `onBoard_changed`: Qt capitalises the first letter, and
+  `onboard_changed` silently never fires); per-move updates go through the cell
+  model and `status_changed`.
+- **Every threaded front-end** (Qt, web, CLI) goes through `session::Controller`;
+  don't reimplement its bookkeeping in a front-end — that is how they drifted
+  apart. Wording and drawing stay in each front-end. The wasm crate does the same
+  work inline, because `wasm32-unknown-unknown` has no threads.
 - **Web**: the template path is resolved at runtime relative to the working directory (`web/templates/**/*`). When running via `cargo run -p web`, the working directory must be the workspace root. The `Tera` instance is created once at startup and is not reloaded; restart the server after template changes during development.
 
 ### Code style
