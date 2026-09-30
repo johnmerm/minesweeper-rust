@@ -70,9 +70,10 @@ it holds a mine. Exact, not sampled:
 fallback, by design. `ConstraintSearch::exhaustive()` removes the bound for
 offline work.
 
-The estimators are fast enough to be called on every move at any board size:
-worst measured single solve is ~12 ms on boards up to 200 a side, against 137
-seconds before decomposition.
+Fast enough to run on every move at any board size: a solve is milliseconds on
+the standard boards, and the worst measured at the current budget is ~375 ms on
+the dense ones, against 137 seconds before decomposition. The page defers it
+past the repaint, so a click never waits on it.
 
 **Never treat a probability of 0.0 or 1.0 as merely a small or large number.**
 Every front-end reads 0.0 as proof that a cell is safe and opens it. The solver
