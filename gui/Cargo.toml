@@ -8,6 +8,3 @@ rust-version.workspace = true
 minesweeper_core = { path = "../minesweeper_core" }
 qmetaobject = "0.2"
 cstr = "0.2"
-
-[features]
-neural = ["minesweeper_core/neural"]

@@ -3,6 +3,7 @@ use std::fmt;
 use serde::Serialize;
 
 pub mod probability;
+pub mod session;
 use probability::{ConstraintSearch, ProbabilityStrategy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

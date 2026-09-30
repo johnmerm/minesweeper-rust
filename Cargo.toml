@@ -16,3 +16,10 @@ resolver = "3"
 # compiling. Resolver 3 reads this and picks compatible versions instead.
 [workspace.package]
 rust-version = "1.94"
+
+# The estimators are unusable unoptimised: the network scores an Expert board
+# in 2.4 s optimised and 128 s without, and every front-end's `cargo run` is a
+# debug build. Optimising the core alone keeps debug builds of the front-ends
+# fast to compile and still debuggable where the UI code lives.
+[profile.dev.package.minesweeper_core]
+opt-level = 3

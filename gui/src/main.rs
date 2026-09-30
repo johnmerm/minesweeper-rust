@@ -1,13 +1,60 @@
-use qmetaobject::prelude::*;
-use qmetaobject::{QVariantList, QVariantMap};
-use minesweeper_core::{Minesweeper, CellState, CellContent, GameState};
-use minesweeper_core::probability::{ConstraintSearch, SimUpdate, Strategy};
-#[cfg(feature = "neural")]
-use minesweeper_core::probability::NeuralNetwork;
-use minesweeper_core::probability::setup::combinations;
+//! Desktop front-end: the same game and the same two estimators as the page in
+//! `docs/`, drawn by Qt.
+//!
+//! The slow work — the exact search and the network — runs on the thread in
+//! [`minesweeper_core::session`], which posts its answers back here through `queued_callback`. This
+//! side keeps the board, decides what each cell looks like, and repaints only
+//! the cells whose appearance changed: on a 200x200 board repainting all 40 000
+//! every move is what makes a front-end slow, not the estimators.
+
 use cstr::cstr;
-use std::collections::HashSet;
-use std::sync::mpsc::Receiver;
+use minesweeper_core::{CellContent, CellState, GameState, Minesweeper};
+use qmetaobject::prelude::*;
+use qmetaobject::{queued_callback, QPointer, SimpleListItem, SimpleListModel};
+use std::cell::RefCell;
+use minesweeper_core::session::{self, Controller, Exact, Reply, Show};
+
+/// A cell on a board the solver could not finish. Deliberately not the grey that
+/// `prob_color(0.0)` produces, which is what "certainly safe" looks like.
+const UNKNOWN: &str = "#c6cbd6";
+
+/// One cell, as QML draws it.
+#[derive(Default, Clone, PartialEq)]
+struct CellView {
+    text: String,
+    fg: String,
+    bg: String,
+    /// Unopened: drawn raised, and clickable.
+    raised: bool,
+    /// Unopened and next to a number: the cells the solver actually reasons about.
+    border: bool,
+    /// The exact probability, `?` when unsolved, empty when not shown.
+    prob: String,
+    /// The network's guess, empty when not shown.
+    guess: String,
+}
+
+impl SimpleListItem for CellView {
+    fn get(&self, role: i32) -> QVariant {
+        match role {
+            0 => QString::from(self.text.as_str()).into(),
+            1 => QString::from(self.fg.as_str()).into(),
+            2 => QString::from(self.bg.as_str()).into(),
+            3 => self.raised.into(),
+            4 => self.border.into(),
+            5 => QString::from(self.prob.as_str()).into(),
+            6 => QString::from(self.guess.as_str()).into(),
+            _ => QVariant::default(),
+        }
+    }
+
+    fn names() -> Vec<QByteArray> {
+        ["text", "fg", "bg", "raised", "border", "prob", "guess"]
+            .iter()
+            .map(|&name| QByteArray::from(name))
+            .collect()
+    }
+}
 
 #[derive(QObject, Default)]
 struct MinesweeperGui {
@@ -15,675 +62,387 @@ struct MinesweeperGui {
 
     board_width: qt_property!(i32; NOTIFY board_changed),
     board_height: qt_property!(i32; NOTIFY board_changed),
+    cells: qt_property!(RefCell<SimpleListModel<CellView>>; CONST),
 
-    cells: qt_property!(QVariantList; NOTIFY board_changed),
-    status_text: qt_property!(QString; NOTIFY board_changed),
-    /// Status line for the Monte Carlo sampling strategy.
-    sim_status: qt_property!(QString; NOTIFY board_changed),
-    /// Status line for the Constraint Search (DFS) strategy.
-    cs_status: qt_property!(QString; NOTIFY board_changed),
-    /// Status line for the Neural Network strategy.
-    nn_status: qt_property!(QString; NOTIFY board_changed),
-    layout_count: qt_property!(QString; NOTIFY board_changed),
-    /// When true, cells whose mine probability is exactly 0 are revealed automatically.
-    auto_reveal: qt_property!(bool; NOTIFY board_changed),
+    /// `Playing` / `You won!` / `Boom — game over`.
+    status_text: qt_property!(QString; NOTIFY status_changed),
+    /// 0 playing, 1 won, 2 lost — QML picks the colour.
+    status_kind: qt_property!(i32; NOTIFY status_changed),
+    mines_left: qt_property!(i32; NOTIFY status_changed),
+    timer_text: qt_property!(QString; NOTIFY status_changed),
+    timer_running: qt_property!(bool; NOTIFY status_changed),
+    /// What the exact search did, or that it is still working.
+    sim_text: qt_property!(QString; NOTIFY status_changed),
+    /// 0 solved, 1 refused, 2 calculating.
+    sim_kind: qt_property!(i32; NOTIFY status_changed),
+    neural_note: qt_property!(QString; NOTIFY status_changed),
+
+    show_probs: qt_property!(bool; NOTIFY settings_changed WRITE set_show_probs),
+    auto_play: qt_property!(bool; NOTIFY settings_changed WRITE set_auto_play),
+    flag_mode: qt_property!(bool; NOTIFY settings_changed),
+    /// Index into Both / Exact / Neural.
+    show_mode: qt_property!(i32; NOTIFY settings_changed WRITE set_show_mode),
+    /// Whether each label is on screen, so QML can place the guess in the
+    /// corner the exact value would otherwise take.
+    show_exact: qt_property!(bool; NOTIFY settings_changed),
+    show_neural: qt_property!(bool; NOTIFY settings_changed),
 
     board_changed: qt_signal!(),
+    status_changed: qt_signal!(),
+    settings_changed: qt_signal!(),
 
     init: qt_method!(fn(&mut self)),
     reveal: qt_method!(fn(&mut self, index: i32)),
     flag: qt_method!(fn(&mut self, index: i32)),
     reset: qt_method!(fn(&mut self, w: i32, h: i32, m: i32)),
-    check_prob_update: qt_method!(fn(&mut self)),
+    hover_text: qt_method!(fn(&self, index: i32) -> QString),
+    tick: qt_method!(fn(&mut self)),
 
-    game: Option<Minesweeper>,
-    /// Best-priority probs — used for cell background colour.
-    probs: Vec<Vec<f64>>,
-    /// Per-strategy probability grids, shown independently in each cell.
-    cs_probs: Vec<Vec<f64>>,
-    #[cfg(feature = "neural")] nn_probs: Vec<Vec<f64>>,
-    cs_has_data: bool,
-    #[cfg(feature = "neural")] nn_has_data: bool,
-    /// Path to ONNX model file; loaded once on first use.
-    #[cfg(feature = "neural")] nn_model_path: String,
-    prob_rx: Option<Receiver<SimUpdate>>,
-    /// Strategies that have sent their Done message.
-    done_strategies: HashSet<Strategy>,
-    /// Priority level of the strategy whose data is currently in `probs`.
-    probs_priority: u8,
+    /// The game, and the session thread answering questions about it.
+    ctl: Option<Controller>,
+    /// What each cell currently shows, so an unchanged cell is not pushed to QML.
+    painted: Vec<CellView>,
 }
 
 impl MinesweeperGui {
     fn init(&mut self) {
-        let game = Minesweeper::new(10, 10, 10);
-        self.board_width = 10;
-        self.board_height = 10;
-        let up = uniform_probs(&game);
-        self.probs = up.clone();
-        self.cs_probs = up.clone();
-        #[cfg(feature = "neural")] { self.nn_probs = up; }
-        #[cfg(feature = "neural")] { self.nn_has_data = false; }
-        #[cfg(not(feature = "neural"))] { let _ = up; }
-        self.cs_has_data = false;
-        #[cfg(feature = "neural")] {
-            self.nn_model_path = std::env::var("NN_MODEL_PATH")
-                .unwrap_or_else(|_| "neural/onnx/model.onnx".to_string());
-        }
-        self.game = Some(game);
-        self.render_cells();
+        self.show_probs = true;
+        let this = QPointer::from(&*self);
+        let deliver = queued_callback(move |reply: Reply| {
+            if let Some(this) = this.as_pinned() {
+                this.borrow_mut().on_reply(reply);
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || session::run(rx, deliver));
+        self.ctl = Some(Controller::new(tx));
+        self.reset(10, 10, 10);
+    }
+
+    fn reset(&mut self, w: i32, h: i32, m: i32) {
+        let Some(ctl) = &mut self.ctl else { return };
+        let (w, h, _) = ctl.new_game(w.max(0) as usize, h.max(0) as usize, m.max(0) as usize);
+        self.board_width = w as i32;
+        self.board_height = h as i32;
+        // A reset rather than per-cell changes: the delegates are for a board of
+        // a different shape.
+        self.painted = vec![CellView::default(); w * h];
+        self.cells.borrow_mut().reset_data(self.painted.clone());
         self.board_changed();
+        self.repaint();
+    }
+
+    fn cell_at(&self, index: i32) -> Option<(usize, usize)> {
+        let game = &self.ctl.as_ref()?.game;
+        let index = usize::try_from(index).ok()?;
+        (index < game.width * game.height).then(|| (index % game.width, index / game.width))
     }
 
     fn reveal(&mut self, index: i32) {
-        if let Some(game) = &mut self.game {
-            let x = (index % self.board_width) as usize;
-            let y = (index / self.board_width) as usize;
-            game.reveal(x, y);
-            self.update_view();
+        if self.flag_mode {
+            return self.flag(index);
+        }
+        let Some((x, y)) = self.cell_at(index) else { return };
+        if self.ctl.as_mut().is_some_and(|ctl| ctl.reveal(x, y)) {
+            self.repaint();
         }
     }
 
     fn flag(&mut self, index: i32) {
-        if let Some(game) = &mut self.game {
-            let x = (index % self.board_width) as usize;
-            let y = (index / self.board_width) as usize;
-            game.toggle_flag(x, y);
-            self.update_view();
+        let Some((x, y)) = self.cell_at(index) else { return };
+        if self.ctl.as_mut().is_some_and(|ctl| ctl.flag(x, y)) {
+            self.repaint();
         }
     }
 
-    fn reset(&mut self, w: i32, h: i32, m: i32) {
-        let w = (w as usize).clamp(3, 50);
-        let h = (h as usize).clamp(3, 50);
-        let m = (m as usize).clamp(1, w * h - 1);
-        self.prob_rx = None;
-        self.done_strategies.clear();
-        self.probs_priority = 0;
-        let game = Minesweeper::new(w, h, m);
-        self.board_width = w as i32;
-        self.board_height = h as i32;
-        let up = uniform_probs(&game);
-        self.probs = up.clone();
-        self.cs_probs = up.clone();
-        #[cfg(feature = "neural")] { self.nn_probs = up; }
-        #[cfg(not(feature = "neural"))] { let _ = up; }
-        self.cs_has_data = false;
-        #[cfg(feature = "neural")] { self.nn_has_data = false; }
-        self.game = Some(game);
-        self.sim_status = QString::default();
-        self.cs_status = QString::default();
-        self.nn_status = QString::default();
-        self.render_cells();
-        self.board_changed();
-    }
-
-    /// Called by the QML Timer every 100 ms. Drains the channel and applies updates.
-    /// Strategies with higher priority override lower-priority probs once they
-    /// have valid data (exact search beats random sampling).
-    fn check_prob_update(&mut self) {
-        let updates: Vec<SimUpdate> = if let Some(rx) = &self.prob_rx {
-            let mut v = Vec::new();
-            while let Ok(u) = rx.try_recv() {
-                v.push(u);
-            }
-            v
-        } else {
-            return;
-        };
-
-        if updates.is_empty() {
-            return;
-        }
-
-        let mut any_change = false;
-
-        for update in updates {
-            match update {
-                SimUpdate::Progress {
-                    strategy: Strategy::ConstraintSearch,
-                    valid,
-                    attempts,
-                    memory_bytes,
-                    probs,
-                    ..
-                } => {
-                    if valid > 0 {
-                        self.cs_probs = probs.clone();
-                        self.cs_has_data = true;
-                        if self.try_update_probs(Strategy::ConstraintSearch, probs) {
-                            any_change = true;
-                        }
-                    }
-                    self.cs_status = if valid > 0 {
-                        QString::from(format!(
-                            "CS: {} layouts / {} steps  [{}]",
-                            valid, attempts, fmt_memory(memory_bytes)
-                        ))
-                    } else {
-                        QString::from(format!("CS: searching…  [{}]", fmt_memory(memory_bytes)))
-                    };
-                }
-                SimUpdate::Done {
-                    strategy: Strategy::ConstraintSearch,
-                    valid,
-                    attempts,
-                    memory_bytes,
-                    probs,
-                } => {
-                    if valid > 0 {
-                        self.cs_probs = probs.clone();
-                        self.cs_has_data = true;
-                        if self.try_update_probs(Strategy::ConstraintSearch, probs) {
-                            any_change = true;
-                        }
-                    }
-                    self.done_strategies.insert(Strategy::ConstraintSearch);
-                    self.cs_status = QString::from(format!(
-                        "✓ CS: {} layouts / {} steps  [{}]",
-                        valid, attempts, fmt_memory(memory_bytes)
-                    ));
-                }
-                #[cfg(feature = "neural")]
-                SimUpdate::Done {
-                    strategy: Strategy::NeuralNetwork,
-                    valid,
-                    memory_bytes,
-                    probs,
-                    ..
-                } => {
-                    if valid > 0 {
-                        self.nn_probs = probs.clone();
-                        self.nn_has_data = true;
-                        if self.try_update_probs(Strategy::NeuralNetwork, probs) {
-                            any_change = true;
-                        }
-                    }
-                    self.done_strategies.insert(Strategy::NeuralNetwork);
-                    self.nn_status = QString::from(format!(
-                        "✓ NN: {} cells  [{}]",
-                        valid, fmt_memory(memory_bytes)
-                    ));
-                }
-                // NeuralNetwork does not send Progress updates (single-shot).
-                #[cfg(feature = "neural")]
-                SimUpdate::Progress {
-                    strategy: Strategy::NeuralNetwork,
-                    ..
-                } => {}
-            }
-        }
-
-        // Close channel once all active strategies have finished.
-        #[cfg(not(feature = "neural"))]
-        let all_active = [Strategy::ConstraintSearch];
-        #[cfg(feature = "neural")]
-        let all_active = [Strategy::ConstraintSearch, Strategy::NeuralNetwork];
-        if all_active.iter().all(|s| self.done_strategies.contains(s)) {
-            self.prob_rx = None;
-        }
-
-        if any_change {
-            self.maybe_auto_reveal();
-            self.render_cells();
-            self.board_changed();
+    fn on_reply(&mut self, reply: Reply) {
+        if self.ctl.as_mut().is_some_and(|ctl| ctl.on_reply(reply)) {
+            self.repaint();
         }
     }
 
-    /// If auto-reveal is on, reveal every hidden cell whose best-estimate mine
-    /// probability is exactly 0. Uses the highest-priority strategy's probs
-    /// (`self.probs`), so CS results (exact) take precedence over MC ones.
-    /// Reveals are done in one pass; the resulting `update_view` call re-launches
-    /// the simulation on the new board state, which may expose further safe cells
-    /// on the next timer tick.
-    fn maybe_auto_reveal(&mut self) {
-        if !self.auto_reveal {
-            return;
-        }
-        // Only act when the game is running and mines are already placed.
-        let should_run = self.game.as_ref()
-            .map(|g| g.state == GameState::Playing && g.mines_generated)
-            .unwrap_or(false);
-        if !should_run {
-            return;
-        }
-
-        let game = self.game.as_ref().unwrap();
-        let to_reveal: Vec<(usize, usize)> = (0..game.height)
-            .flat_map(|y| (0..game.width).map(move |x| (x, y)))
-            .filter(|&(x, y)| {
-                game.grid[y][x].state == CellState::Hidden
-                    && self.probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(1.0) < 1e-9
-            })
-            .collect();
-
-        if to_reveal.is_empty() {
-            return;
-        }
-
-        let game = self.game.as_mut().unwrap();
-        for (x, y) in to_reveal {
-            game.reveal(x, y);
-        }
-        // Re-run the simulation on the updated board; the timer will call
-        // check_prob_update → maybe_auto_reveal again if new safe cells appear.
-        self.update_view();
+    fn set_show_probs(&mut self, on: bool) {
+        self.show_probs = on;
+        self.repaint();
     }
 
-    /// Update `self.probs` with `new_probs` if `strategy` has higher or equal
-    /// priority than whoever last wrote `self.probs`. Returns true when updated.
-    fn try_update_probs(&mut self, strategy: Strategy, new_probs: Vec<Vec<f64>>) -> bool {
-        if strategy.priority() >= self.probs_priority {
-            self.probs = new_probs;
-            self.probs_priority = strategy.priority();
-            true
-        } else {
-            false
+    fn set_auto_play(&mut self, on: bool) {
+        self.auto_play = on;
+        if let Some(ctl) = &mut self.ctl {
+            ctl.set_auto_play(on);
         }
+        self.repaint();
     }
 
-    /// Render immediately with cached probs, then start all background strategies.
-    fn update_view(&mut self) {
-        self.render_cells();
-        self.board_changed();
-
-        if let Some(game) = &self.game {
-            if game.state == GameState::Playing && game.mines_generated {
-                let game_clone = game.clone();
-                let game_clone2 = game_clone.clone();
-                #[cfg(feature = "neural")]
-                let game_clone3 = game_clone.clone();
-
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.prob_rx = Some(rx);
-                self.done_strategies.clear();
-                self.probs_priority = 0;
-                self.cs_has_data = false;
-                #[cfg(feature = "neural")] { self.nn_has_data = false; }
-
-                let cs_tx = tx.clone();
-                #[cfg(feature = "neural")]
-                let nn_tx = tx;
-                #[cfg(not(feature = "neural"))]
-                drop(tx);
-
-                std::thread::spawn(move || {
-                    ConstraintSearch::new().calculate_with_progress(&game_clone2, cs_tx);
-                });
-
-                #[cfg(feature = "neural")]
-                {
-                    let model_path = self.nn_model_path.clone();
-                    std::thread::spawn(move || {
-                        match NeuralNetwork::new(&model_path) {
-                            Ok(nn) => nn.calculate_with_progress(&game_clone3, nn_tx),
-                            Err(e) => {
-                                eprintln!("NeuralNetwork load error: {e}");
-                            }
-                        }
-                    });
-                }
-            }
+    fn set_show_mode(&mut self, index: i32) {
+        self.show_mode = index;
+        if let Some(ctl) = &mut self.ctl {
+            ctl.set_show(Show::from_index(index));
         }
+        self.repaint();
     }
 
-    fn render_cells(&mut self) {
-        if let Some(game) = &self.game {
-            let mut new_cells = QVariantList::default();
+    fn tick(&mut self) {
+        let Some(ctl) = &self.ctl else { return };
+        let secs = ctl.elapsed().as_secs();
+        self.timer_text = format!("{}:{:02}", secs / 60, secs % 60).into();
+        self.timer_running = ctl.timing();
+        self.status_changed();
+    }
 
-            // Count hidden + flagged cells and remaining mines for layout count.
-            let n: usize = (0..game.height)
-                .flat_map(|y| (0..game.width).map(move |x| (x, y)))
-                .filter(|&(x, y)| matches!(game.grid[y][x].state, CellState::Hidden | CellState::Flagged))
-                .count();
-            let k = game.mines_count;
-            let cs_done = self.done_strategies.contains(&Strategy::ConstraintSearch);
-            self.layout_count = if game.state == GameState::Playing {
-                let tick = if cs_done { "✓ " } else { "" };
-                QString::from(format!("{}{} possible layouts", tick, fmt_count(combinations(n, k))))
-            } else {
-                QString::default()
-            };
+    /// Recompute every cell's appearance and push the ones that changed.
+    fn repaint(&mut self) {
+        let Some(ctl) = &self.ctl else { return };
+        let game = &ctl.game;
+        let exact_on = ctl.show != Show::Neural;
+        let neural_on = ctl.neural_wanted();
+        let over = game.state != GameState::Playing;
+        let solved = ctl.exact.as_ref().and_then(|e| e.probs.as_ref());
+        let calculating = ctl.exact.is_none();
 
+        {
+            let mut model = self.cells.borrow_mut();
             for y in 0..game.height {
                 for x in 0..game.width {
-                    let cell = &game.grid[y][x];
-                    let mut map = QVariantMap::default();
-                    let p = self.probs.get(y).and_then(|row| row.get(x)).copied().unwrap_or(0.0);
-
-                    let prob_bg = |p: f64| -> String {
-                        let r = (204.0 + 51.0 * p).round() as u8;
-                        let g = (204.0 * (1.0 - p)).round() as u8;
-                        format!("#{:02x}{:02x}{:02x}", r, g, g)
-                    };
-
-                    let (color, bg_color): (&str, String) = match cell.state {
-                        CellState::Hidden => ("black", prob_bg(p)),
-                        CellState::Flagged => ("red", prob_bg(p)),
-                        CellState::Visible => match cell.content {
-                            CellContent::Mine => ("white", "red".to_string()),
-                            CellContent::Empty(0) => ("black", "#eee".to_string()),
-                            CellContent::Empty(n) => {
-                                let c = match n {
-                                    1 => "blue",
-                                    2 => "green",
-                                    3 => "red",
-                                    4 => "darkblue",
-                                    _ => "black"
-                                };
-                                (c, "#eee".to_string())
-                            }
-                        },
-                    };
-
-                    let final_text = if cell.state == CellState::Visible {
-                        if let CellContent::Empty(n) = cell.content {
-                            if n > 0 { n.to_string() } else { "".to_string() }
-                        } else if let CellContent::Mine = cell.content {
-                            "*".to_string()
-                        } else { "".to_string() }
-                    } else if cell.state == CellState::Flagged {
-                        "F".to_string()
-                    } else {
-                        "".to_string()
-                    };
-
-                    let is_hidden = matches!(cell.state, CellState::Hidden | CellState::Flagged);
-                    let cs_p = self.cs_probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(0.0);
-                    let cs_prob_text = if is_hidden && self.cs_has_data {
-                        format!("{:.0}%", cs_p * 100.0)
-                    } else { String::new() };
-                    #[cfg(feature = "neural")]
-                    let nn_prob_text = {
-                        let nn_p = self.nn_probs.get(y).and_then(|r| r.get(x)).copied().unwrap_or(0.0);
-                        if is_hidden && self.nn_has_data {
-                            format!("{:.0}%", nn_p * 100.0)
-                        } else { String::new() }
-                    };
-                    #[cfg(not(feature = "neural"))]
-                    let nn_prob_text = String::new();
-
-                    // A hidden cell is a "border" cell if it is adjacent to at least one
-                    // visible numbered cell — i.e. it is directly constrained.
-                    let is_border = matches!(cell.state, CellState::Hidden | CellState::Flagged)
-                        && (-1isize..=1)
-                            .flat_map(|dy| (-1isize..=1).map(move |dx| (dx, dy)))
-                            .filter(|&(dx, dy)| dx != 0 || dy != 0)
-                            .any(|(dx, dy)| {
-                                let nx = x as isize + dx;
-                                let ny = y as isize + dy;
-                                nx >= 0
-                                    && nx < game.width as isize
-                                    && ny >= 0
-                                    && ny < game.height as isize
-                                    && game.grid[ny as usize][nx as usize].state
-                                        == CellState::Visible
-                                    && matches!(
-                                        game.grid[ny as usize][nx as usize].content,
-                                        CellContent::Empty(n) if n > 0
-                                    )
-                            });
-
-                    map.insert(QString::from("text"), QString::from(final_text).into());
-                    map.insert(QString::from("color"), QString::from(color).into());
-                    map.insert(QString::from("bgColor"), QString::from(bg_color).into());
-                    map.insert(QString::from("csProbText"), QString::from(cs_prob_text).into());
-                    map.insert(QString::from("nnProbText"), QString::from(nn_prob_text).into());
-                    map.insert(QString::from("isBorder"), is_border.into());
-                    new_cells.push(map.into());
+                    let i = y * game.width + x;
+                    let exact = solved.map(|p| p[i]);
+                    let guess = ctl.neural.probs.get(i).copied().filter(|&g| neural_on && g >= 0.0);
+                    let view = cell_view(game, x, y, exact_on, exact, calculating, guess, over, self.show_probs);
+                    if self.painted[i] != view {
+                        self.painted[i] = view.clone();
+                        model.change_line(i, view);
+                    }
                 }
             }
-            self.cells = new_cells;
-
-            self.status_text = match game.state {
-                GameState::Playing => QString::from(format!("Mines: {}", game.mines_count)),
-                GameState::Won => QString::from("YOU WON!"),
-                GameState::Lost => QString::from("GAME OVER"),
-            };
         }
+
+        let flags = game.grid.iter().flatten().filter(|c| c.state == CellState::Flagged).count();
+        self.mines_left = game.mines_count as i32 - flags as i32;
+        (self.status_text, self.status_kind) = match game.state {
+            GameState::Playing => ("Playing".into(), 0),
+            GameState::Won => ("You won!".into(), 1),
+            GameState::Lost => ("Boom — game over".into(), 2),
+        };
+        (self.sim_text, self.sim_kind) = describe_exact(ctl.exact.as_ref());
+        self.neural_note = describe_neural(ctl).into();
+        self.show_exact = exact_on;
+        self.show_neural = neural_on;
+        self.settings_changed();
+        self.tick();
+    }
+
+    /// The line under the board while the pointer is over a cell.
+    fn hover_text(&self, index: i32) -> QString {
+        let (Some(ctl), Some((x, y))) = (&self.ctl, self.cell_at(index)) else {
+            return QString::default();
+        };
+        if ctl.game.grid[y][x].state == CellState::Visible {
+            return QString::default();
+        }
+        let i = y * ctl.game.width + x;
+        let mut parts = Vec::new();
+        if ctl.show != Show::Neural {
+            parts.push(match &ctl.exact {
+                None => "Mine probability: calculating…".to_string(),
+                Some(Exact { probs: Some(p), .. }) => format!("Mine probability: {:.1}%", p[i] * 100.0),
+                Some(_) => "Mine probability: not known — the search did not finish".to_string(),
+            });
+        }
+        if ctl.neural_wanted() {
+            let guess = ctl.neural.probs.get(i).copied().unwrap_or(-1.0);
+            parts.push(if guess >= 0.0 {
+                format!("network: {:.1}%", guess * 100.0)
+            } else {
+                "network: …".to_string()
+            });
+        }
+        parts.join(" · ").into()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn uniform_probs(game: &Minesweeper) -> Vec<Vec<f64>> {
-    let p = game.mines_count as f64 / (game.width * game.height) as f64;
-    vec![vec![p; game.width]; game.height]
+/// The solver line, and whether it reports a solve (0), a refusal (1) or a wait (2).
+fn describe_exact(exact: Option<&Exact>) -> (QString, i32) {
+    let Some(exact) = exact else { return ("calculating…".into(), 2) };
+    if exact.probs.is_none() {
+        let text = format!(
+            "no exact answer within {} nodes — showing none rather than guessing",
+            thousands(exact.nodes)
+        );
+        return (text.into(), 1);
+    }
+    let looked = exact.cache_hits + exact.cache_misses;
+    let reuse = if looked > 0 {
+        format!(" · {}% reused", (100 * exact.cache_hits + looked / 2) / looked)
+    } else {
+        String::new()
+    };
+    let text = format!(
+        "exact: {} region layouts / {} nodes [{}]{reuse}",
+        thousands(exact.layouts),
+        thousands(exact.nodes),
+        fmt_memory(exact.memory_bytes)
+    );
+    (text.into(), 0)
 }
 
-/// Human-readable memory size (B / KB / MB).
+/// The network line, worded as `describeNeural` in `docs/minesweeper.js`.
+fn describe_neural(ctl: &Controller) -> String {
+    let neural = &ctl.neural;
+    if neural.broken {
+        return "network: this build carries no usable weights".into();
+    }
+    if ctl.show != Show::Exact && !ctl.neural_wanted() {
+        return "network: not scored automatically on a board this large — pick a mode to ask for it".into();
+    }
+    if !ctl.neural_wanted() {
+        return String::new();
+    }
+    if neural.total == 0 {
+        return "network: …".into();
+    }
+    let done = neural.total - neural.remaining;
+    let mut text = if neural.remaining > 0 {
+        format!("network: {} / {} cells…", thousands(done), thousands(neural.total))
+    } else {
+        format!("network: {} cells", thousands(neural.total))
+    };
+    if let Some(error) = neural.error {
+        text += &format!(" · off by {:.1} points, corrected", error * 100.0);
+    } else if ctl.show == Show::Neural {
+        text += " · uncorrected";
+    }
+    if neural.opened + neural.flagged > 0 {
+        text += &format!(" · it has opened {} and flagged {}", neural.opened, neural.flagged);
+        match ctl.game.state {
+            GameState::Lost => text += ", then hit a mine",
+            GameState::Won => text += ", and won",
+            GameState::Playing => {}
+        }
+    }
+    if neural.stuck {
+        text += " · nothing it is sure enough about";
+    }
+    text
+}
+
+/// How one cell looks, from everything known about it.
+#[allow(clippy::too_many_arguments)]
+fn cell_view(
+    game: &Minesweeper,
+    x: usize,
+    y: usize,
+    exact_on: bool,
+    exact: Option<f32>,
+    calculating: bool,
+    guess: Option<f32>,
+    over: bool,
+    show_probs: bool,
+) -> CellView {
+    let cell = &game.grid[y][x];
+    match cell.state {
+        CellState::Hidden | CellState::Flagged => {
+            // The tint follows whichever estimate is on screen. While the exact
+            // answer is still coming, the cell keeps plain grey rather than a
+            // colour belonging to the previous board — or to no board at all.
+            let bg = match (exact_on, exact, guess) {
+                (true, Some(p), _) => prob_color(p),
+                (true, None, _) if !calculating => UNKNOWN.to_string(),
+                (false, _, Some(g)) => prob_color(g),
+                _ => "#cccccc".to_string(),
+            };
+            let labels = show_probs && !over;
+            let prob = match (labels && exact_on, exact) {
+                (true, Some(p)) => format!("{:.0}%", p * 100.0),
+                (true, None) if !calculating => "?".to_string(),
+                _ => String::new(),
+            };
+            let guess = match (labels, guess) {
+                (true, Some(g)) => format!("{:.0}%", g * 100.0),
+                _ => String::new(),
+            };
+            let flagged = cell.state == CellState::Flagged;
+            CellView {
+                text: if flagged { "⚑".into() } else { String::new() },
+                fg: "#c1121f".into(),
+                bg,
+                raised: true,
+                border: next_to_number(game, x, y),
+                prob,
+                guess,
+            }
+        }
+        CellState::Visible => match cell.content {
+            CellContent::Mine => CellView {
+                text: "✹".into(),
+                fg: "#ffffff".into(),
+                bg: "#e5383b".into(),
+                ..CellView::default()
+            },
+            CellContent::Empty(n) => CellView {
+                text: if n > 0 { n.to_string() } else { String::new() },
+                fg: number_color(n).into(),
+                bg: "#eeeeee".into(),
+                ..CellView::default()
+            },
+        },
+    }
+}
+
+/// Whether an unopened cell touches a visible number.
+fn next_to_number(game: &Minesweeper, x: usize, y: usize) -> bool {
+    (y.saturating_sub(1)..=(y + 1).min(game.height - 1)).any(|ny| {
+        (x.saturating_sub(1)..=(x + 1).min(game.width - 1)).any(|nx| {
+            let n = &game.grid[ny][nx];
+            n.state == CellState::Visible && matches!(n.content, CellContent::Empty(k) if k > 0)
+        })
+    })
+}
+
+/// Grey → red, matching the page, the CLI and the Actix front-end.
+fn prob_color(p: f32) -> String {
+    let r = (204.0 + 51.0 * p).round() as u8;
+    let gb = (204.0 * (1.0 - p)).round() as u8;
+    format!("#{r:02x}{gb:02x}{gb:02x}")
+}
+
+/// The classic digit colours, as `.n1`–`.n8` on the page.
+fn number_color(n: u8) -> &'static str {
+    match n {
+        1 => "#0000ff",
+        2 => "#007b00",
+        3 => "#e00000",
+        4 => "#00007b",
+        5 => "#7b0000",
+        6 => "#008080",
+        7 => "#000000",
+        _ => "#808080",
+    }
+}
+
 fn fmt_memory(bytes: usize) -> String {
     match bytes {
-        b if b < 1_024             => format!("{} B", b),
-        b if b < 1_024 * 1_024    => format!("{:.1} KB", b as f64 / 1_024.0),
-        b                          => format!("{:.1} MB", b as f64 / 1_048_576.0),
+        b if b < 1_024 => format!("{b} B"),
+        b if b < 1_024 * 1_024 => format!("{:.1} KB", b as f64 / 1_024.0),
+        b => format!("{:.1} MB", b as f64 / 1_048_576.0),
     }
 }
 
-/// Human-readable scale suffix (K / M / B / T / scientific).
-fn fmt_count(v: f64) -> String {
-    match v {
-        v if v < 1_000.0          => format!("{:.0}", v),
-        v if v < 1_000_000.0      => format!("{:.1}K", v / 1e3),
-        v if v < 1_000_000_000.0  => format!("{:.1}M", v / 1e6),
-        v if v < 1e12             => format!("{:.1}B", v / 1e9),
-        v if v < 1e15             => format!("{:.1}T", v / 1e12),
-        v                         => format!("{:.2e}", v),
+/// `1234567` → `1,234,567`, as `toLocaleString` gives the page.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
     }
+    out
 }
-
-const QML: &str = r##"
-import QtQuick 2.0
-import QtQuick.Controls 2.0
-import QtQuick.Layouts 1.0
-import Minesweeper 1.0
-
-ApplicationWindow {
-    id: root
-    visible: true
-
-    // Approximate height / width consumed by non-grid UI elements (margins, labels, controls).
-    property int uiPadH: 210
-    property int uiPadW: 20
-
-    // Cell size fills available window space, clamped to a sensible minimum.
-    property int cellSize: Math.max(10, Math.floor(
-        Math.min(
-            (root.width  - uiPadW) / minesweeper.board_width,
-            (root.height - uiPadH) / minesweeper.board_height
-        )
-    ))
-
-    width:  320
-    height: 520
-    minimumWidth:  minesweeper.board_width  * 12 + uiPadW
-    minimumHeight: minesweeper.board_height * 12 + uiPadH
-    title: "Rust Minesweeper"
-
-    property string hoveredProb: ""
-    property int prevBoardW: -1
-    property int prevBoardH: -1
-
-    // Resize the window to a sensible default whenever the board dimensions change
-    // (i.e. a new game with different W/H). Moves don't change dimensions so the
-    // window stays at whatever size the user last dragged it to.
-    Connections {
-        target: minesweeper
-        function onBoard_changed() {
-            if (minesweeper.board_width !== prevBoardW || minesweeper.board_height !== prevBoardH) {
-                root.width  = minesweeper.board_width  * 32 + root.uiPadW
-                root.height = minesweeper.board_height * 32 + root.uiPadH
-                prevBoardW = minesweeper.board_width
-                prevBoardH = minesweeper.board_height
-            }
-        }
-    }
-
-    MinesweeperGame {
-        id: minesweeper
-        Component.onCompleted: init()
-    }
-
-    Timer {
-        interval: 100
-        running: true
-        repeat: true
-        onTriggered: minesweeper.check_prob_update()
-    }
-
-    ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 10
-        spacing: 4
-
-        Text {
-            text: root.hoveredProb !== "" ? root.hoveredProb : minesweeper.status_text
-            font.pixelSize: 20
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Text {
-            visible: minesweeper.layout_count !== ""
-            text: minesweeper.layout_count
-            font.pixelSize: 11
-            color: "#555"
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Text {
-            visible: minesweeper.sim_status !== ""
-            text: minesweeper.sim_status
-            font.pixelSize: 11
-            color: "#888"
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Text {
-            visible: minesweeper.cs_status !== ""
-            text: minesweeper.cs_status
-            font.pixelSize: 11
-            color: "#668"
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        Text {
-            visible: minesweeper.nn_status !== ""
-            text: minesweeper.nn_status
-            font.pixelSize: 11
-            color: "#468"
-            Layout.alignment: Qt.AlignHCenter
-        }
-
-        GridLayout {
-            columns: minesweeper.board_width
-            columnSpacing: 2
-            rowSpacing: 2
-            Layout.alignment: Qt.AlignHCenter
-
-            Repeater {
-                model: minesweeper.cells
-                delegate: Rectangle {
-                    width: root.cellSize
-                    height: root.cellSize
-                    color: modelData.bgColor
-                    border.color: modelData.isBorder ? "#5599ff" : "#999"
-                    border.width: modelData.isBorder ? 2 : 1
-
-                    Text {
-                        anchors.centerIn: parent
-                        text: modelData.text
-                        color: modelData.color
-                        font.bold: true
-                        font.pixelSize: Math.max(8, root.cellSize - 10)
-                    }
-
-                    Text {
-                        visible: modelData.csProbText !== "" && root.cellSize >= 14
-                        text: modelData.csProbText
-                        font.pixelSize: 7
-                        color: "#558"
-                        anchors.bottom: parent.bottom
-                        anchors.right: parent.right
-                        anchors.margins: 1
-                    }
-
-                    Text {
-                        visible: modelData.nnProbText !== "" && root.cellSize >= 14
-                        text: modelData.nnProbText
-                        font.pixelSize: 7
-                        color: "#468"
-                        anchors.bottom: parent.bottom
-                        anchors.left: parent.left
-                        anchors.margins: 1
-                    }
-
-                    MouseArea {
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        acceptedButtons: Qt.LeftButton | Qt.RightButton
-                        onEntered: {
-                            var cs = modelData.csProbText
-                            var nn = modelData.nnProbText
-                            if (cs !== "" || nn !== "") {
-                                root.hoveredProb = "exact: " + (cs !== "" ? cs : "not solved") + "  |  network: " + (nn !== "" ? nn : "?")
-                            } else {
-                                root.hoveredProb = ""
-                            }
-                        }
-                        onExited: root.hoveredProb = ""
-                        onClicked: {
-                            if (mouse.button === Qt.RightButton) {
-                                minesweeper.flag(index)
-                            } else {
-                                minesweeper.reveal(index)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // New-game settings row
-        RowLayout {
-            Layout.alignment: Qt.AlignHCenter
-            spacing: 6
-
-            Text { text: "W:"; font.pixelSize: 12 }
-            SpinBox { id: wSpin; from: 3; to: 50; value: 10; implicitWidth: 75 }
-
-            Text { text: "H:"; font.pixelSize: 12 }
-            SpinBox { id: hSpin; from: 3; to: 50; value: 10; implicitWidth: 75 }
-
-            Text { text: "M:"; font.pixelSize: 12 }
-            SpinBox { id: mSpin; from: 1; to: 999; value: 10; implicitWidth: 80 }
-        }
-
-        RowLayout {
-            Layout.alignment: Qt.AlignHCenter
-            spacing: 10
-
-            CheckBox {
-                text: "Auto-reveal safe cells"
-                checked: minesweeper.auto_reveal
-                onCheckedChanged: minesweeper.auto_reveal = checked
-                font.pixelSize: 12
-            }
-
-            Button {
-                text: "New Game"
-                onClicked: minesweeper.reset(wSpin.value, hSpin.value, mSpin.value)
-            }
-        }
-
-        Item { Layout.fillHeight: true }
-    }
-}
-"##;
 
 fn main() {
     qml_register_type::<MinesweeperGui>(cstr!("Minesweeper"), 1, 0, cstr!("MinesweeperGame"));
     let mut engine = QmlEngine::new();
-    engine.load_data(QML.into());
+    engine.load_data(include_str!("main.qml").into());
     engine.exec();
 }
