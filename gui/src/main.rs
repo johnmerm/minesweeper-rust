@@ -13,22 +13,22 @@ use std::sync::mpsc::Receiver;
 struct MinesweeperGui {
     base: qt_base_class!(trait QObject),
 
-    board_width: qt_property!(i32; NOTIFY boardChanged),
-    board_height: qt_property!(i32; NOTIFY boardChanged),
+    board_width: qt_property!(i32; NOTIFY board_changed),
+    board_height: qt_property!(i32; NOTIFY board_changed),
 
-    cells: qt_property!(QVariantList; NOTIFY boardChanged),
-    status_text: qt_property!(QString; NOTIFY boardChanged),
+    cells: qt_property!(QVariantList; NOTIFY board_changed),
+    status_text: qt_property!(QString; NOTIFY board_changed),
     /// Status line for the Monte Carlo sampling strategy.
-    sim_status: qt_property!(QString; NOTIFY boardChanged),
+    sim_status: qt_property!(QString; NOTIFY board_changed),
     /// Status line for the Constraint Search (DFS) strategy.
-    cs_status: qt_property!(QString; NOTIFY boardChanged),
+    cs_status: qt_property!(QString; NOTIFY board_changed),
     /// Status line for the Neural Network strategy.
-    nn_status: qt_property!(QString; NOTIFY boardChanged),
-    layout_count: qt_property!(QString; NOTIFY boardChanged),
+    nn_status: qt_property!(QString; NOTIFY board_changed),
+    layout_count: qt_property!(QString; NOTIFY board_changed),
     /// When true, cells whose mine probability is exactly 0 are revealed automatically.
-    auto_reveal: qt_property!(bool; NOTIFY boardChanged),
+    auto_reveal: qt_property!(bool; NOTIFY board_changed),
 
-    boardChanged: qt_signal!(),
+    board_changed: qt_signal!(),
 
     init: qt_method!(fn(&mut self)),
     reveal: qt_method!(fn(&mut self, index: i32)),
@@ -71,7 +71,7 @@ impl MinesweeperGui {
         }
         self.game = Some(game);
         self.render_cells();
-        self.boardChanged();
+        self.board_changed();
     }
 
     fn reveal(&mut self, index: i32) {
@@ -114,7 +114,7 @@ impl MinesweeperGui {
         self.cs_status = QString::default();
         self.nn_status = QString::default();
         self.render_cells();
-        self.boardChanged();
+        self.board_changed();
     }
 
     /// Called by the QML Timer every 100 ms. Drains the channel and applies updates.
@@ -225,7 +225,7 @@ impl MinesweeperGui {
         if any_change {
             self.maybe_auto_reveal();
             self.render_cells();
-            self.boardChanged();
+            self.board_changed();
         }
     }
 
@@ -284,7 +284,7 @@ impl MinesweeperGui {
     /// Render immediately with cached probs, then start all background strategies.
     fn update_view(&mut self) {
         self.render_cells();
-        self.boardChanged();
+        self.board_changed();
 
         if let Some(game) = &self.game {
             if game.state == GameState::Playing && game.mines_generated {
@@ -510,7 +510,7 @@ ApplicationWindow {
     // window stays at whatever size the user last dragged it to.
     Connections {
         target: minesweeper
-        function onBoardChanged() {
+        function onBoard_changed() {
             if (minesweeper.board_width !== prevBoardW || minesweeper.board_height !== prevBoardH) {
                 root.width  = minesweeper.board_width  * 32 + root.uiPadW
                 root.height = minesweeper.board_height * 32 + root.uiPadH

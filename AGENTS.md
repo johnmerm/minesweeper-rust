@@ -341,7 +341,11 @@ That, not a bigger budget, is what closes the remaining few percent.
   consult a full solve only once propagation has run dry. Re-solving after each
   pass is what made one click take 31 seconds. Only ever act on a *proven* 0% —
   the exact search's, never sampling's.
-- **GUI**: `update_view` is synchronous and blocks the Qt event loop while computing probabilities. If the board grows or `MAX_VALID`/`MAX_ATTEMPTS` are increased significantly, move the computation to a background thread and emit `boardChanged` when done.
+- **GUI**: `update_view` renders immediately with the cached probabilities, then spawns one
+  thread per strategy, all sending on a shared `mpsc` channel. A QML `Timer` calls
+  `check_prob_update` every 100 ms to drain it, so the Qt event loop never waits on a
+  solve. Emit `board_changed` after any state change; QML reaches it as `onBoard_changed`
+  (Qt capitalises the first letter — `onboard_changed` silently never fires).
 - **Web**: the template path is resolved at runtime relative to the working directory (`web/templates/**/*`). When running via `cargo run -p web`, the working directory must be the workspace root. The `Tera` instance is created once at startup and is not reloaded; restart the server after template changes during development.
 
 ### Code style
